@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔥 whoburnedmore
+<a href="https://whoburnedmore.com"><img src="assets/banner.svg" alt="whoburnedmore — see how many tokens your AI coding agents really burned" width="860"></a>
 
 ### See how many tokens your AI coding agents *really* burned.
 
@@ -140,9 +140,13 @@ npm run build      # bundle to dist/cli.js
 
 ## 📄 License
 
-[MIT](./LICENSE) © 2026 whoburnedmore
+The **code** is [MIT](./LICENSE) © 2026 whoburnedmore — use it, fork it, build on it.
+
+The whoburnedmore **name, logo, and brand assets** (everything in [`assets/`](./assets)) are trademarks of whoburnedmore and are **not** covered by the MIT license. Please don't use them in a way that implies endorsement by or affiliation with whoburnedmore.
 
 <div align="center">
 <br>
-<strong>🔥 whoburnedmore</strong> &nbsp;·&nbsp; <a href="https://whoburnedmore.com">whoburnedmore.com</a>
+<a href="https://whoburnedmore.com"><img src="assets/logo.svg" alt="whoburnedmore" width="72"></a>
+<br><br>
+<strong>whoburnedmore</strong> &nbsp;·&nbsp; <a href="https://whoburnedmore.com">whoburnedmore.com</a>
 </div>
