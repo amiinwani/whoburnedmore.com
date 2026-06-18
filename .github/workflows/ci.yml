@@ -15,5 +15,5 @@ jobs:
           node-version: 20
       - run: npm install
       - run: npm run typecheck
+      - run: npm run build # build first so the zero-network/version guards cover the bundle
       - run: npm test
-      - run: npm run build

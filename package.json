@@ -1,6 +1,6 @@
 {
   "name": "whoburnedmore",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "🔥 See how many tokens your AI coding agents really burned — a fast, 100% local CLI for Claude Code usage. No account, no upload, nothing leaves your machine.",
   "type": "module",
   "bin": {
@@ -15,7 +15,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.js --banner:js=\"#!/usr/bin/env node\" && chmod +x dist/cli.js",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "start": "node dist/cli.js",

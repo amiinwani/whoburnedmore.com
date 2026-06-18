@@ -24,9 +24,9 @@ npm start          # run the CLI locally
 ## Good first issues
 
 - Add or correct models in the [pricing table](./src/pricing.ts).
-- Support transcript formats from other AI coding agents (Codex, Cursor, Gemini CLI, …).
+- Support transcript formats from more AI coding agents. **Claude Code** and **OpenAI Codex** are supported today; **Cursor** is a future addition that would need an optional external tool to read its store.
 - Improve the HTML dashboard layout or add a chart.
-- Add a `--by-day` sparkline to the terminal report.
+- ~~Add a `--by-day` sparkline to the terminal report.~~ ✅ Done in 1.1.0.
 
 ## Reporting bugs
 

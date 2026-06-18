@@ -4,3 +4,10 @@ dist/
 .DS_Store
 whoburnedmore.html
 coverage/
+
+# ultragoal / agent goal-tracking — never publish to the public repo
+.ultragoal/
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+docs/superpowers/
