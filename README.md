@@ -2,9 +2,9 @@
 
 <a href="https://whoburnedmore.com"><img src="assets/banner.svg" alt="whoburnedmore — see how many tokens your AI coding agents really burned" width="860"></a>
 
-### See how many tokens your AI coding agents *really* burned.
+### Know exactly how many tokens — and dollars — your AI coding agents burned.
 
-A fast CLI that reads your [Claude Code](https://claude.com/claude-code) usage and shows exactly how many tokens — and how many dollars — you've burned.
+**A local-first CLI that parses the session transcripts already on your disk and turns them into a token-and-cost report.** It streams your [Claude Code](https://claude.com/claude-code) and [OpenAI Codex](https://openai.com/codex) logs line by line, aggregates usage by model, project, agent, tool and day, prices it against a transparent table — and makes **zero network calls** doing it.
 
 [![CI](https://github.com/amiinwani/whoburnedmore.com/actions/workflows/ci.yml/badge.svg)](https://github.com/amiinwani/whoburnedmore.com/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3ddc84.svg)](./LICENSE)
@@ -21,7 +21,7 @@ No install, no sign-up — just run:
 npx whoburnedmore
 ```
 
-See your burn in seconds — **then land on the global leaderboard at [whoburnedmore.com](https://whoburnedmore.com)**, where developers around the world compare who's burned the most across Claude Code, Codex, Cursor and more.
+It reads only the numeric `usage` counters in your transcripts — never your prompts or code — so you get a full report in seconds. Then **land on the global leaderboard at [whoburnedmore.com](https://whoburnedmore.com)**, where developers around the world compare who's burned the most across Claude Code, Codex, Cursor and more.
 
 > ### 🏆 Think you've burned the most?
 >
@@ -55,7 +55,7 @@ See your burn in seconds — **then land on the global leaderboard at [whoburned
 
 ## ✨ Features
 
-- **🔒 Local-first.** The open-source edition reads the transcripts already on your disk and makes **zero** network requests — no telemetry, no account, no API keys. A committed [zero-network test](./test/zero-network.test.ts) enforces this on every build.
+- **🔒 Local-first, provably.** The open-source edition reads the transcripts already on your disk and makes **zero** network requests — no telemetry, no account, no API keys. This isn't a promise: a committed [zero-network test](./test/zero-network.test.ts) greps **both the TypeScript source and the built `dist/` bundle** for `fetch`, raw sockets (`node:net`/`tls`/`dgram`), `WebSocket` and any `http(s)://` literal on every CI run, so a regression that phones home fails the build.
 - **🤖 Multi-agent.** Counts both **Claude Code** and **OpenAI Codex** usage, folded into one report with a **by-agent** breakdown. Filter to one with `--agent`.
 - **💸 Real cost estimates.** Turns raw token counts into dollar figures using a transparent, editable [pricing table](./src/pricing.ts) — labelled with the month the prices were last reviewed.
 - **🧩 Breakdowns that matter.** See your burn split **by model**, **by project**, **by agent**, and **by tool** (with per-tool call counts and error rates), so you know exactly where the tokens went.
@@ -63,7 +63,7 @@ See your burn in seconds — **then land on the global leaderboard at [whoburned
 - **🧑‍💻 Honest per-message stats.** Counts your *real typed messages* (not tool results or injected prompts) and reports avg tokens and cost per message, plus how much your subagents burned.
 - **⚡ Prompt-cache insight.** Surfaces your cache read-hit rate — the single biggest lever on what you actually pay.
 - **🖼️ Beautiful HTML dashboard.** `--html` writes a self-contained, offline dashboard you can open in any browser or share.
-- **🪶 Tiny & dependency-free at runtime.** A small single-file bundle with no runtime dependencies. Nothing to trust but the code you can read here.
+- **🪶 Tiny & dependency-free at runtime.** Strict TypeScript compiled to a single esbuild bundle (`dist/cli.js`) with **zero runtime dependencies** — the only third-party code is dev-time build/test tooling. Built on Node's standard library, it runs on any **Node ≥ 20**. Nothing to trust but the code you can read here.
 
 ## 🧑‍💻 Run from source — the open-source local edition
 
@@ -123,9 +123,26 @@ Claude Code stores one [JSON Lines](https://jsonlines.org) transcript per sessio
 ~/.claude/projects/<project>/<session-id>.jsonl
 ```
 
-Every assistant turn in those files carries a `usage` block — input tokens, output tokens, and the prompt-cache read/write counts — plus the model name and a timestamp. whoburnedmore streams through those files line by line, adds the counts up by model, by project, by day, by agent and by tool, multiplies by a public pricing table for a dollar estimate, and draws the report. That's the whole trick. The code is small on purpose — start with [`src/scan.ts`](./src/scan.ts).
+Every assistant turn in those files carries a `usage` block — input tokens, output tokens, and the prompt-cache read/write counts — plus the model name and a timestamp.
 
-It does the same for **OpenAI Codex** rollouts under `~/.codex/sessions` (when present): it reads each turn's `token_count` record, maps cached input onto cache reads and reasoning onto output, and tags every entry with its agent so the report can break usage down per agent. If you only use one agent, the other's directory is simply absent and ignored.
+The parser ([`src/scan.ts`](./src/scan.ts)) is a **streaming line reader**: it opens each file with `createReadStream` and walks it through `node:readline`, so a single line — not the whole transcript — is ever held in memory, and it folds each turn straight into per-key accumulators (`Map`s keyed by model, project, agent, tool and UTC day). Footgun-proofing is built in: it **skips files over 64 MB and caps the scan at 5,000 files** so a pathological transcript store can never hang or OOM the CLI, and a malformed JSON line is skipped rather than fatal. The result is a single `Report` object the renderers turn into the terminal view, `--html` dashboard, or `--json`. The code is small on purpose — start with `scan.ts`.
+
+It does the same for **OpenAI Codex** rollouts under `~/.codex/sessions` (when present): it pulls `cwd` + `model` from the session-meta / turn-context records, reads each turn's `token_count` record, maps cached input onto cache reads and reasoning onto output, and tags every entry with its `agent` so the report can break usage down per agent. Sidechain (subagent) turns are accounted separately, and only *real human-typed* user turns form the denominator for per-message averages. If you only use one agent, the other's directory is simply absent and ignored.
+
+### Architecture at a glance
+
+A deliberately flat pipeline — read → aggregate → render — with one module per stage and no shared mutable state between them:
+
+| Module | Responsibility |
+| --- | --- |
+| [`src/scan.ts`](./src/scan.ts) | Streaming transcript reader + aggregator. Walks Claude Code & Codex `*.jsonl` line by line and folds usage into the per-key `Map`s of a single `Report`. |
+| [`src/pricing.ts`](./src/pricing.ts) | Public per-model price table (USD per 1M tokens), tagged with the month it was last reviewed. `estimateCost()` is the only thing that turns tokens into dollars. |
+| [`src/report.ts`](./src/report.ts) | Renders a `Report` as the colourful terminal view. Dependency-free ANSI styling that auto-disables on non-TTY / `NO_COLOR`. |
+| [`src/html.ts`](./src/html.ts) | Renders the same `Report` as one self-contained HTML file — inline CSS, no external fonts/scripts/trackers, zero network requests. |
+| [`src/format.ts`](./src/format.ts) | Pure formatting helpers (token/USD humanizing, bars, sparklines) shared by both renderers. |
+| [`src/cli.ts`](./src/cli.ts) | Arg parsing, flag validation, and wiring the stages together. |
+
+Every renderer consumes the same immutable `Report`, so a new output format is just another pure function of that object. The build (`scripts/build.mjs`) bundles it all to a single `dist/cli.js` with esbuild.
 
 ## 🛡️ Privacy
 

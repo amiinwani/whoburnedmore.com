@@ -1,7 +1,7 @@
 {
   "name": "whoburnedmore",
   "version": "1.1.0",
-  "description": "🔥 See how many tokens your AI coding agents really burned — a fast, 100% local CLI for Claude Code usage. No account, no upload, nothing leaves your machine.",
+  "description": "🔥 Know exactly how many tokens — and dollars — your AI coding agents burned. A fast, 100% local CLI that parses your Claude Code & OpenAI Codex session transcripts into a token-and-cost report. No account, no upload, zero network calls.",
   "type": "module",
   "bin": {
     "whoburnedmore": "dist/cli.js"
