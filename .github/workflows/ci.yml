@@ -1,12 +1,10 @@
-name: CI
-
+name: ci
 on:
   push:
     branches: [main]
   pull_request:
-
 jobs:
-  build-and-test:
+  build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,6 +12,6 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - run: npm run typecheck
-      - run: npm run build # build first so the zero-network/version guards cover the bundle
+      - run: npm run build
+      - run: npm run lint
       - run: npm test

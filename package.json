@@ -1,38 +1,36 @@
 {
   "name": "whoburnedmore",
-  "version": "1.1.0",
-  "description": "🔥 Know exactly how many tokens — and dollars — your AI coding agents burned. A fast, 100% local CLI that parses your Claude Code & OpenAI Codex session transcripts into a token-and-cost report. No account, no upload, zero network calls.",
+  "version": "0.8.7",
+  "description": "Find out who burned more — submit your AI coding-agent token usage to the public leaderboard at whoburnedmore.com",
   "type": "module",
   "bin": {
-    "whoburnedmore": "dist/cli.js"
+    "whoburnedmore": "dist/index.js"
   },
   "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
+    "dist/index.js"
   ],
+  "scripts": {
+    "build": "rm -rf dist && esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --external:ccusage --external:picocolors --external:tokscale",
+    "test": "vitest run",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "ccusage": "20.0.9",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "zod": "^3.23.0"
+  },
   "engines": {
     "node": ">=20"
   },
-  "scripts": {
-    "build": "node scripts/build.mjs",
-    "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
-    "start": "node dist/cli.js",
-    "prepare": "npm run build || true"
-  },
-  "keywords": [
-    "claude",
-    "claude-code",
-    "tokens",
-    "token-usage",
-    "ai",
-    "cli",
-    "cost",
-    "llm",
-    "usage",
-    "anthropic"
-  ],
+  "license": "MIT",
+  "author": "whoburnedmore <132888838+amiinwani@users.noreply.github.com>",
   "homepage": "https://whoburnedmore.com",
   "repository": {
     "type": "git",
@@ -41,11 +39,19 @@
   "bugs": {
     "url": "https://github.com/amiinwani/whoburnedmore.com/issues"
   },
-  "license": "MIT",
-  "devDependencies": {
-    "@types/node": "^20.14.0",
-    "esbuild": "^0.28.1",
-    "tsx": "^4.19.0",
-    "typescript": "^5.5.0"
+  "keywords": [
+    "ai",
+    "tokens",
+    "leaderboard",
+    "claude-code",
+    "codex",
+    "gemini-cli",
+    "copilot",
+    "ccusage",
+    "usage",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

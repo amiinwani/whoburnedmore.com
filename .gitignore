@@ -2,10 +2,9 @@ node_modules/
 dist/
 *.log
 .DS_Store
-whoburnedmore.html
-coverage/
+*.tgz
 
-# ultragoal / agent goal-tracking — never publish to the public repo
+# agent goal-tracking — never publish to the public repo
 .ultragoal/
 CLAUDE.md
 GEMINI.md

@@ -1,0 +1,121 @@
+import type { AnonSubmitResponse, SubmitPayload } from "./shared.js";
+
+export function apiBase(): string {
+  return process.env.WHOBURNEDMORE_API ?? "https://api.whoburnedmore.com";
+}
+
+/**
+ * The web app origin (whoburnedmore.com). The local dashboard bakes this into
+ * its "Connect your account" form so the file:// page can hand its data off to
+ * the website. Overridable for local dev / tests.
+ */
+export function webBase(): string {
+  return process.env.WHOBURNEDMORE_WEB ?? "https://whoburnedmore.com";
+}
+
+/** Parse a response body as JSON, tolerating empty or non-JSON responses. */
+async function readJson<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  if (!text) return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    // The gateway returned HTML/plain text (e.g. a 502/503 during an Azure cold
+    // start or deploy). Surface a clear, parseable error instead of a raw
+    // "Unexpected token <" crash.
+    return {
+      error:
+        res.status >= 500
+          ? "the leaderboard server is temporarily unavailable — try again in a minute"
+          : `unexpected response from the server (HTTP ${res.status})`,
+    } as T;
+  }
+}
+
+async function post<T>(
+  path: string,
+  body: unknown,
+): Promise<{ status: number; body: T }> {
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase()}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new Error(
+      "couldn't reach the leaderboard server — check your connection and try again",
+    );
+  }
+  return { status: res.status, body: await readJson<T>(res) };
+}
+
+/** Submit anonymously: no sign-in, the key owns a public, shareable dashboard. */
+export async function anonSubmit(
+  anonKey: string,
+  payload: SubmitPayload,
+): Promise<AnonSubmitResponse> {
+  const { status, body } = await post<
+    AnonSubmitResponse | { error: string; details?: string[] }
+  >("/v1/anon/submit", { ...payload, anonKey });
+  if (status !== 200) {
+    const err = body as { error: string; details?: string[] };
+    const details = err.details?.length ? `\n  - ${err.details.join("\n  - ")}` : "";
+    throw new Error(`${err.error ?? `submit failed (HTTP ${status})`}${details}`);
+  }
+  return body as AnonSubmitResponse;
+}
+
+/**
+ * Append this machine's owner key to its dashboard URL as a fragment. The CLI
+ * opens this so the browser can offer "claim" — the fragment is never sent to
+ * the server or leaked in referrers/logs.
+ */
+export function claimUrl(dashboardUrl: string, anonKey: string): string {
+  return `${dashboardUrl}#k=${encodeURIComponent(anonKey)}`;
+}
+
+/**
+ * Open a freshly-joined friends board with the same claim handoff a solo run
+ * gets on /d/<slug>: the owner key plus this device's dashboard slug, both as
+ * URL fragment params (never sent to the server / leaked in referrers). The
+ * board page reads them so signing in there CLAIMS this machine's submission —
+ * merging the usage and carrying the board membership onto the account — so the
+ * joiner shows up as a real, named row instead of "anonymous". The `u=<slug>`
+ * also lets the board highlight "that's you" and surface the claim prompt.
+ */
+export function boardClaimUrl(
+  boardUrl: string,
+  slug: string,
+  anonKey: string,
+): string {
+  return `${boardUrl}#k=${encodeURIComponent(anonKey)}&u=${encodeURIComponent(slug)}`;
+}
+
+/** Show or hide this machine's anonymous dashboard on the public leaderboard. */
+export async function anonVisibility(
+  anonKey: string,
+  listed: boolean,
+): Promise<void> {
+  const { status, body } = await post<{ error?: string }>(
+    "/v1/anon/visibility",
+    { anonKey, listed },
+  );
+  if (status !== 200) {
+    throw new Error(body.error ?? `failed (HTTP ${status})`);
+  }
+}
+
+/** Permanently delete this machine's anonymous dashboard and its usage. */
+export async function anonRemove(anonKey: string): Promise<void> {
+  const res = await fetch(`${apiBase()}/v1/anon`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ anonKey }),
+  });
+  if (res.status !== 200) {
+    const b = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(b.error ?? `failed (HTTP ${res.status})`);
+  }
+}

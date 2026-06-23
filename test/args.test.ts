@@ -1,85 +1,64 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
-import { ArgError, parseArgs } from "../src/cli.js";
+import { describe, expect, it } from "vitest";
+import { parseBoard, resolveCommand } from "../src/args.js";
 
-test("parseArgs reads the simple boolean flags", () => {
-  assert.equal(parseArgs(["--help"]).help, true);
-  assert.equal(parseArgs(["--version"]).version, true);
-  assert.equal(parseArgs(["--json"]).json, true);
-  assert.equal(parseArgs(["--by-day"]).byDay, true);
-});
+describe("parseBoard", () => {
+  it("reads --board=<code>", () => {
+    expect(parseBoard(["--board=abc123"])).toBe("abc123");
+  });
 
-test("parseArgs handles -h / -v aliases", () => {
-  assert.equal(parseArgs(["-h"]).help, true);
-  assert.equal(parseArgs(["-v"]).version, true);
-});
+  it("reads --board <code> (space form)", () => {
+    expect(parseBoard(["--board", "deadbeef"])).toBe("deadbeef");
+  });
 
-test("parseArgs throws ArgError on an unknown flag", () => {
-  assert.throws(() => parseArgs(["--nope"]), (e: unknown) => {
-    assert.ok(e instanceof ArgError);
-    assert.match((e as ArgError).message, /unknown option '--nope'/);
-    return true;
+  it("is undefined when absent", () => {
+    expect(parseBoard(["--dry-run"])).toBeUndefined();
+    expect(parseBoard([])).toBeUndefined();
+  });
+
+  it("ignores an empty value and a following flag", () => {
+    expect(parseBoard(["--board="])).toBeUndefined();
+    expect(parseBoard(["--board", "--local"])).toBeUndefined();
+  });
+
+  it("coexists with other flags in any order", () => {
+    expect(parseBoard(["--dry-run", "--board=lab7", "--no-submit"])).toBe("lab7");
   });
 });
 
-test("parseArgs throws on a bare positional argument", () => {
-  assert.throws(() => parseArgs(["wat"]), ArgError);
-});
-
-test("parseArgs rejects a non-numeric --since (no silent all-time)", () => {
-  assert.throws(() => parseArgs(["--since", "abc"]), (e: unknown) => {
-    assert.ok(e instanceof ArgError);
-    assert.match((e as ArgError).message, /positive number/);
-    return true;
+describe("resolveCommand", () => {
+  it("defaults to run with no args", () => {
+    expect(resolveCommand([])).toBe("run");
   });
-});
 
-test("parseArgs rejects --since 0 and negatives", () => {
-  assert.throws(() => parseArgs(["--since", "0"]), ArgError);
-  assert.throws(() => parseArgs(["--since", "-5"]), ArgError);
-});
+  it("treats lone non-command flags as a run (with those flags applied elsewhere)", () => {
+    expect(resolveCommand(["--dry-run"])).toBe("run");
+    expect(resolveCommand(["--local"])).toBe("run");
+    expect(resolveCommand(["--board=abc"])).toBe("run");
+  });
 
-test("parseArgs accepts a valid --since", () => {
-  assert.equal(parseArgs(["--since", "30"]).sinceDays, 30);
-});
+  it("maps --help and -h to help — never a silent run/submit", () => {
+    // Regression: --help/-h start with '-', so the old first-non-dash-arg
+    // resolution fell through to "run" and PUBLICLY SUBMITTED the user's usage.
+    expect(resolveCommand(["--help"])).toBe("help");
+    expect(resolveCommand(["-h"])).toBe("help");
+    expect(resolveCommand(["help"])).toBe("help");
+  });
 
-test("parseArgs errors when a value-taking flag has no value", () => {
-  assert.throws(() => parseArgs(["--since"]), ArgError);
-  assert.throws(() => parseArgs(["--dir"]), ArgError);
-  // a flag followed by another flag is also "no value"
-  assert.throws(() => parseArgs(["--dir", "--json"]), ArgError);
-});
+  it("maps --version and -v to version", () => {
+    expect(resolveCommand(["--version"])).toBe("version");
+    expect(resolveCommand(["-v"])).toBe("version");
+    expect(resolveCommand(["version"])).toBe("version");
+  });
 
-test("--html takes an OPTIONAL path", () => {
-  const noPath = parseArgs(["--html"]);
-  assert.equal(noPath.html, true);
-  assert.equal(noPath.htmlPath, undefined);
+  it("help wins even alongside other flags or subcommands", () => {
+    expect(resolveCommand(["private", "--help"])).toBe("help");
+    expect(resolveCommand(["--dry-run", "-h"])).toBe("help");
+  });
 
-  const withPath = parseArgs(["--html", "out.html"]);
-  assert.equal(withPath.html, true);
-  assert.equal(withPath.htmlPath, "out.html");
-
-  // a following flag is not swallowed as the path
-  const thenFlag = parseArgs(["--html", "--json"]);
-  assert.equal(thenFlag.html, true);
-  assert.equal(thenFlag.htmlPath, undefined);
-  assert.equal(thenFlag.json, true);
-});
-
-test("--agent only accepts known agents", () => {
-  assert.equal(parseArgs(["--agent", "codex"]).agent, "codex");
-  assert.equal(parseArgs(["--agent", "claude-code"]).agent, "claude-code");
-  assert.throws(() => parseArgs(["--agent", "cursor"]), ArgError);
-});
-
-test("parseArgs is order-independent and combines flags", () => {
-  const a = parseArgs(["--since", "7", "--json", "--dir", "/tmp/x", "--by-day"]);
-  assert.equal(a.sinceDays, 7);
-  assert.equal(a.json, true);
-  assert.equal(a.dir, "/tmp/x");
-  assert.equal(a.byDay, true);
-
-  // reordered -> same result
-  const b = parseArgs(["--by-day", "--dir", "/tmp/x", "--json", "--since", "7"]);
-  assert.deepEqual(b, a);
+  it("returns an explicit subcommand verbatim (so unknowns still error in main)", () => {
+    expect(resolveCommand(["private"])).toBe("private");
+    expect(resolveCommand(["sync"])).toBe("sync");
+    expect(resolveCommand(["remove"])).toBe("remove");
+    expect(resolveCommand(["bogus"])).toBe("bogus");
+  });
 });
