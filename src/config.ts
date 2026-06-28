@@ -17,9 +17,13 @@ export interface CliConfig {
    *  reporting — a truer signal than the log file's mtime, which moves on any
    *  write (including errors). */
   lastSyncAt?: number;
+  /** Epoch ms after the one-time launch-open desktop notification was delivered. */
+  launchNotificationDeliveredAt?: number;
 }
 
 export function defaultConfigDir(): string {
+  const override = process.env.WHOBURNEDMORE_CONFIG_DIR?.trim();
+  if (override) return override;
   return join(homedir(), ".config", "whoburnedmore");
 }
 
@@ -35,6 +39,12 @@ export function loadConfig(dir: string = defaultConfigDir()): CliConfig | null {
     if (typeof parsed.anonKey === "string") config.anonKey = parsed.anonKey;
     if (typeof parsed.lastSyncAt === "number" && Number.isFinite(parsed.lastSyncAt))
       config.lastSyncAt = parsed.lastSyncAt;
+    if (
+      typeof parsed.launchNotificationDeliveredAt === "number" &&
+      Number.isFinite(parsed.launchNotificationDeliveredAt)
+    ) {
+      config.launchNotificationDeliveredAt = parsed.launchNotificationDeliveredAt;
+    }
     return Object.keys(config).length > 0 ? config : null;
   } catch {
     return null;
@@ -80,4 +90,12 @@ export function recordSync(
 ): void {
   const config = loadConfig(dir) ?? {};
   saveConfig(dir, { ...config, lastSyncAt: when });
+}
+
+export function recordLaunchNotificationDelivered(
+  dir: string = defaultConfigDir(),
+  when: number = Date.now(),
+): void {
+  const config = loadConfig(dir) ?? {};
+  saveConfig(dir, { ...config, launchNotificationDeliveredAt: when });
 }

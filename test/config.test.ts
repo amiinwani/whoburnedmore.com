@@ -3,13 +3,30 @@ import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  defaultConfigDir,
   ensureAnonKey,
   loadConfig,
   recordSync,
+  recordLaunchNotificationDelivered,
   saveConfig,
 } from "../src/config.js";
 
 describe("config", () => {
+  it("allows a disposable config directory override for local testing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wbm-test-"));
+    const prev = process.env.WHOBURNEDMORE_CONFIG_DIR;
+    process.env.WHOBURNEDMORE_CONFIG_DIR = dir;
+    try {
+      expect(defaultConfigDir()).toBe(dir);
+      const first = ensureAnonKey();
+      expect(first).toMatch(/^[0-9a-f]{64}$/);
+      expect(loadConfig()?.anonKey).toBe(first);
+    } finally {
+      if (prev === undefined) delete process.env.WHOBURNEDMORE_CONFIG_DIR;
+      else process.env.WHOBURNEDMORE_CONFIG_DIR = prev;
+    }
+  });
+
   it("round-trips the anon key", () => {
     const dir = mkdtempSync(join(tmpdir(), "wbm-test-"));
     expect(loadConfig(dir)).toBeNull();
@@ -65,6 +82,17 @@ describe("config", () => {
     expect(loadConfig(dir)).toEqual({
       anonKey: "k".repeat(64),
       lastSyncAt: 1234567890,
+    });
+  });
+
+  it("records launch notification delivery while preserving sync state", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wbm-test-"));
+    saveConfig(dir, { anonKey: "k".repeat(64), lastSyncAt: 123 });
+    recordLaunchNotificationDelivered(dir, 456);
+    expect(loadConfig(dir)).toEqual({
+      anonKey: "k".repeat(64),
+      lastSyncAt: 123,
+      launchNotificationDeliveredAt: 456,
     });
   });
 

@@ -1,21 +1,15 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
-import type {
-  AgentStat,
-  ProjectStat,
-  SkillStat,
-  ToolStat,
-} from "./shared.js";
-import { estimateCostUSD } from "./pricing.js";
+import { join } from "node:path";
+import type { AgentStat, SkillStat, ToolStat } from "./shared.js";
 
 // ccusage gives tokens by tool/model, but not which tools/skills/MCP servers you
-// actually invoke, which projects you spend in, how much runs inside subagents,
-// or how reliable your tools are. That all lives in Claude Code's transcripts:
-// each record may have an `attributionSkill`, assistant messages carry `tool_use`
-// blocks (name = tool) plus a `usage` block (tokens) and a `cwd` (project) and an
-// `isSidechain` flag (subagent), and tool failures show up as `tool_result`
-// blocks with `is_error`. We count names + tokens — never arguments or content.
+// actually invoke, how much runs inside subagents, or how reliable your tools
+// are. That all lives in Claude Code's transcripts: each record may have an
+// `attributionSkill`, assistant messages carry `tool_use` blocks (name = tool)
+// plus a `usage` block (tokens) and an `isSidechain` flag (subagent), and tool
+// failures show up as `tool_result` blocks with `is_error`. We count names +
+// tokens — never arguments, content, project/repo names, or conversation titles.
 // Best-effort and bounded so a huge ~/.claude never makes the CLI hang.
 
 const CLAUDE_PROJECTS = join(homedir(), ".claude", "projects");
@@ -27,7 +21,6 @@ const MAX_FILE_BYTES = 64 * 1024 * 1024;
 // animating even while we're chewing through transcripts.
 const TIME_BUDGET_MS = 12_000;
 const MAX_STATS = 300;
-const MAX_PROJECTS = 500;
 
 /**
  * Count tool_use names and the attributionSkill on one parsed transcript record.
@@ -68,7 +61,6 @@ export function countRecord(
 export interface Accumulator {
   tools: Map<string, { count: number; errors: number; tokens: number }>;
   skills: Map<string, { count: number; tokens: number }>;
-  projects: Map<string, { tokens: number; costUSD: number }>;
   agent: {
     messageCount: number;
     subagentMessages: number;
@@ -77,8 +69,6 @@ export interface Accumulator {
     /** Messages the human actually sent (their prompts). */
     userMessageCount: number;
   };
-  /** sessionId -> latest AI title. */
-  titles: Map<string, string>;
   /** sessionId -> assistant message count. */
   sessionMessages: Map<string, number>;
 }
@@ -92,7 +82,6 @@ export function createAccumulator(): Accumulator {
   return {
     tools: new Map(),
     skills: new Map(),
-    projects: new Map(),
     agent: {
       messageCount: 0,
       subagentMessages: 0,
@@ -100,7 +89,6 @@ export function createAccumulator(): Accumulator {
       totalTokens: 0,
       userMessageCount: 0,
     },
-    titles: new Map(),
     sessionMessages: new Map(),
   };
 }
@@ -155,9 +143,10 @@ function hasHumanText(content: unknown): boolean {
 /**
  * Fold one parsed transcript record into the accumulator. Handles: tool_use
  * names + per-tool error counts (matched by tool_use_id within the file),
- * per-project tokens/cost (by `cwd` basename), subagent vs total tokens/messages,
- * per-session message counts, AI titles, and attributionSkill. Pure aside from
- * the maps it mutates; unknown shapes are ignored.
+ * subagent vs total tokens/messages, per-session message counts, and
+ * attributionSkill. Pure aside from the maps it mutates; unknown shapes are
+ * ignored. Deliberately ignores `cwd` (repo/project names) and `aiTitle`
+ * (conversation titles) — that data is never collected.
  */
 export function processRecord(
   rec: unknown,
@@ -167,11 +156,9 @@ export function processRecord(
   if (!rec || typeof rec !== "object") return;
   const r = rec as {
     type?: unknown;
-    cwd?: unknown;
     isSidechain?: unknown;
     isMeta?: unknown;
     sessionId?: unknown;
-    aiTitle?: unknown;
     attributionSkill?: unknown;
     message?: { role?: unknown; content?: unknown; model?: unknown; usage?: unknown };
   };
@@ -197,17 +184,6 @@ export function processRecord(
     sk.count += 1;
     sk.tokens += recTokens;
     acc.skills.set(s, sk);
-  }
-
-  // AI-generated session title (one record type per session; last one wins).
-  if (
-    r.type === "ai-title" &&
-    typeof r.aiTitle === "string" &&
-    r.aiTitle &&
-    typeof r.sessionId === "string" &&
-    r.sessionId
-  ) {
-    acc.titles.set(r.sessionId, r.aiTitle.slice(0, 200));
   }
 
   const content = r.message?.content;
@@ -243,7 +219,7 @@ export function processRecord(
       if (tu.id) ctx.toolNames.set(tu.id, tu.name);
     }
 
-    // Per-message tokens → project, subagent, message-count rollups.
+    // Per-message tokens → subagent + message-count rollups.
     const tokens = recTokens;
     acc.agent.messageCount += 1;
     acc.agent.totalTokens += tokens;
@@ -257,25 +233,6 @@ export function processRecord(
         r.sessionId,
         (acc.sessionMessages.get(r.sessionId) ?? 0) + 1,
       );
-    }
-    if (typeof r.cwd === "string" && r.cwd && tokens > 0) {
-      const name = basename(r.cwd).slice(0, 128) || "unknown";
-      const model = typeof r.message?.model === "string" ? r.message.model : "unknown";
-      const u = r.message?.usage as Record<string, unknown> | undefined;
-      const num = (v: unknown) => {
-        const x = Math.round(Number(v));
-        return Number.isFinite(x) && x > 0 ? x : 0;
-      };
-      const cost = estimateCostUSD(model, {
-        inputTokens: num(u?.input_tokens),
-        outputTokens: num(u?.output_tokens),
-        cacheCreationTokens: num(u?.cache_creation_input_tokens),
-        cacheReadTokens: num(u?.cache_read_input_tokens),
-      });
-      const p = acc.projects.get(name) ?? { tokens: 0, costUSD: 0 };
-      p.tokens += tokens;
-      p.costUSD += cost;
-      acc.projects.set(name, p);
     }
   } else if (isUser) {
     // tool_result errors → bump the matching tool's error count.
@@ -326,25 +283,10 @@ function toToolStats(
     });
 }
 
-function toProjectStats(map: Map<string, { tokens: number; costUSD: number }>): ProjectStat[] {
-  return [...map.entries()]
-    .map(([name, v]) => ({
-      name,
-      tokens: v.tokens,
-      costUSD: Number(v.costUSD.toFixed(6)),
-    }))
-    .filter((p) => p.tokens > 0)
-    .sort((a, b) => b.tokens - a.tokens)
-    .slice(0, MAX_PROJECTS);
-}
-
 export interface AttributionResult {
   tools: ToolStat[];
   skills: SkillStat[];
-  projects: ProjectStat[];
   agent: AgentStat;
-  /** sessionId -> AI title (joined onto session rollups by collect). */
-  titles: Map<string, string>;
   /** sessionId -> assistant message count. */
   sessionMessages: Map<string, number>;
   /**
@@ -359,9 +301,7 @@ export function accumulatorToResult(acc: Accumulator): AttributionResult {
   return {
     tools: toToolStats(acc.tools),
     skills: toSkillStats(acc.skills),
-    projects: toProjectStats(acc.projects),
     agent: { ...acc.agent },
-    titles: acc.titles,
     sessionMessages: acc.sessionMessages,
     complete: true,
   };
@@ -374,24 +314,22 @@ function numTok(v: unknown): number {
 
 /** Per-file scratch state for a Codex rollout transcript. */
 export interface CodexContext {
-  cwd: string;
-  model: string;
   /** function_calls seen since the last token_count, for the per-tool token split. */
   pending: Array<{ name: string; id?: string }>;
 }
 export function createCodexContext(): CodexContext {
-  return { cwd: "", model: "unknown", pending: [] };
+  return { pending: [] };
 }
 
 /**
  * Fold one Codex rollout record into the accumulator. Codex writes a JSONL
- * "rollout" per session: `session_meta`/`turn_context` carry the `cwd` + model,
- * `response_item` payloads of type `function_call` (or `custom_tool_call` /
- * `local_shell_call`) are tool calls (MCP tools keep their server-prefixed name),
- * and `event_msg` payloads of type `token_count` carry the turn's
- * `last_token_usage`. We attribute that turn's tokens to the project (cwd) and
- * split them across the tools called in the turn. Codex has no subagent concept,
- * so the subagent counters stay zero. Names + counts only — never content.
+ * "rollout" per session: `response_item` payloads of type `function_call` (or
+ * `custom_tool_call` / `local_shell_call`) are tool calls (MCP tools keep their
+ * server-prefixed name), and `event_msg` payloads of type `token_count` carry
+ * the turn's `last_token_usage`. We split that turn's tokens across the tools
+ * called in the turn. Codex has no subagent concept, so the subagent counters
+ * stay zero. Names + counts only — never content, and never the `cwd`
+ * (repo/project name).
  */
 export function processCodexRecord(
   rec: unknown,
@@ -404,11 +342,8 @@ export function processCodexRecord(
   const pl = r.payload as Record<string, unknown>;
   const ptype = pl.type;
 
-  if (r.type === "session_meta" || r.type === "turn_context") {
-    if (typeof pl.cwd === "string" && pl.cwd) ctx.cwd = pl.cwd;
-    if (typeof pl.model === "string" && pl.model) ctx.model = pl.model;
-    return;
-  }
+  // session_meta / turn_context carry cwd + model, which we no longer collect.
+  if (r.type === "session_meta" || r.type === "turn_context") return;
 
   if (
     ptype === "function_call" ||
@@ -451,20 +386,6 @@ export function processCodexRecord(
 
     acc.agent.messageCount += 1;
     acc.agent.totalTokens += tokens;
-
-    if (ctx.cwd) {
-      const name = basename(ctx.cwd).slice(0, 128) || "unknown";
-      const cost = estimateCostUSD(ctx.model, {
-        inputTokens,
-        outputTokens,
-        cacheCreationTokens: 0,
-        cacheReadTokens,
-      });
-      const proj = acc.projects.get(name) ?? { tokens: 0, costUSD: 0 };
-      proj.tokens += tokens;
-      proj.costUSD += cost;
-      acc.projects.set(name, proj);
-    }
 
     const per =
       ctx.pending.length > 0 ? Math.floor(tokens / ctx.pending.length) : 0;
@@ -533,12 +454,14 @@ function listTranscripts(dir: string): string[] {
 }
 
 /**
- * Parse local agent transcripts into tool/skill/project/subagent/title rollups.
- * Sources: Claude Code (`~/.claude/projects`, plus `CLAUDE_CONFIG_DIR` /
- * `~/.config/claude` overrides) and Codex (`~/.codex/sessions`). ccusage already
- * aggregates many agents for token *totals*; this adds the per-agent attribution
- * (which tools/MCP servers, which projects, subagent share) that only lives in
- * the transcripts. Returns empties when nothing is available — never throws.
+ * Parse local agent transcripts into tool/skill/subagent rollups (plus per-session
+ * assistant message counts). Sources: Claude Code (`~/.claude/projects`, plus
+ * `CLAUDE_CONFIG_DIR` / `~/.config/claude` overrides) and Codex
+ * (`~/.codex/sessions`). ccusage already aggregates many agents for token
+ * *totals*; this adds the per-agent attribution (which tools/MCP servers,
+ * subagent share) that only lives in the transcripts. We never read repo/project
+ * names (`cwd`) or conversation titles. Returns empties when nothing is
+ * available — never throws.
  */
 export async function collectAttribution(): Promise<AttributionResult> {
   const acc = createAccumulator();

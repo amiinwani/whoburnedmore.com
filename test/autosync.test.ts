@@ -10,25 +10,40 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildLaunchdPlist,
+  buildSystemdService,
+  buildSystemdTimer,
   cronSchedule,
+  expectedLinuxCronLine,
   plistDrift,
   reconcileAction,
+  notifyLaunchLive,
+  resolveNpmPath,
   resolveNodePath,
+  syncCommandArgs,
+  shellQuote,
+  systemdQuote,
+  windowsCommandLine,
+  xmlEscape,
   rotateLogIfLarge,
   SYNC_INTERVAL_MINUTES,
   syncIntervalLabel,
 } from "../src/autosync.js";
 
 describe("buildLaunchdPlist", () => {
-  it("produces a launchd plist that runs the sync command on an interval", () => {
+  it("produces a launchd plist that runs the latest npm package on an interval", () => {
     const plist = buildLaunchdPlist(
-      "/usr/local/bin/node",
-      "/path/to/cli.js",
+      syncCommandArgs("/usr/local/bin/npm"),
       "/home/u/.config/whoburnedmore/sync.log",
     );
     expect(plist).toContain("com.whoburnedmore.sync");
-    expect(plist).toContain("/usr/local/bin/node");
-    expect(plist).toContain("/path/to/cli.js");
+    expect(plist).toContain("/usr/local/bin/npm");
+    expect(plist).toContain("<string>exec</string>");
+    expect(plist).toContain("<string>--yes</string>");
+    expect(plist).toContain("<string>--ignore-scripts</string>");
+    expect(plist).toContain("<string>--package</string>");
+    expect(plist).toContain("<string>whoburnedmore@latest</string>");
+    expect(plist).toContain("<string>--</string>");
+    expect(plist).toContain("<string>whoburnedmore</string>");
     expect(plist).toContain("<string>sync</string>");
     expect(plist).toContain("/home/u/.config/whoburnedmore/sync.log");
     expect(plist).not.toContain("/tmp/");
@@ -49,12 +64,139 @@ describe("buildLaunchdPlist", () => {
   });
 
   it("runs at load so a sync catches up after a reboot/login", () => {
-    const plist = buildLaunchdPlist("/usr/local/bin/node", "/path/to/cli.js");
+    const plist = buildLaunchdPlist(syncCommandArgs("/usr/local/bin/npm"));
     // RunAtLoad must be true (not false) so a machine that missed a scheduled
     // tick while off/asleep syncs immediately on next login.
     expect(plist).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
     expect(plist).not.toMatch(/<key>RunAtLoad<\/key>\s*<false\/>/);
     expect(plist).toContain("<key>ProcessType</key>");
+  });
+
+  it("escapes launchd XML values", () => {
+    const plist = buildLaunchdPlist(
+      syncCommandArgs("/home/a&b/bin/npm"),
+      "/home/a&b/.config/whoburnedmore/sync.log",
+    );
+    expect(plist).toContain("/home/a&amp;b/bin/npm");
+    expect(plist).toContain("/home/a&amp;b/.config/whoburnedmore/sync.log");
+    expect(plist).not.toContain("/home/a&b/bin/npm");
+  });
+});
+
+describe("scheduled sync command", () => {
+  it("uses npm exec with latest package and no lifecycle scripts", () => {
+    expect(syncCommandArgs("/usr/local/bin/npm")).toEqual([
+      "/usr/local/bin/npm",
+      "exec",
+      "--yes",
+      "--ignore-scripts",
+      "--package",
+      "whoburnedmore@latest",
+      "--",
+      "whoburnedmore",
+      "sync",
+    ]);
+  });
+
+  it("quotes linux cron command and log paths without shell injection", () => {
+    const logPath = "/home/me/.config/whoburnedmore/sync log'$(touch hacked).log";
+    const line = expectedLinuxCronLine({
+      npmPath: "/home/me/bin/npm with space",
+      logPath,
+    });
+    expect(line).toContain("*/15 * * * *");
+    expect(line).toContain("'whoburnedmore@latest'");
+    expect(line).toContain("'sync'");
+    expect(line).toContain(shellQuote(logPath));
+  });
+
+  it("quotes windows scheduled-task commands", () => {
+    const line = windowsCommandLine(syncCommandArgs("C:\\Program Files\\nodejs\\npm.cmd"));
+    expect(line).toContain('"C:\\Program Files\\nodejs\\npm.cmd"');
+    expect(line).toContain('"whoburnedmore@latest"');
+    expect(line).toContain('"sync"');
+  });
+
+  it("keeps escaping helpers deterministic", () => {
+    expect(xmlEscape(`a&b<"c'>`)).toBe("a&amp;b&lt;&quot;c&apos;&gt;");
+    expect(shellQuote(`a'b`)).toBe(`'a'\"'\"'b'`);
+  });
+});
+
+describe("systemd user-timer fallback (linux without crontab)", () => {
+  it("builds a oneshot service that runs the latest package on each tick", () => {
+    const service = buildSystemdService(syncCommandArgs("/usr/local/bin/npm"));
+    expect(service).toContain("[Service]");
+    expect(service).toContain("Type=oneshot");
+    expect(service).toContain('ExecStart="/usr/local/bin/npm"');
+    expect(service).toContain('"whoburnedmore@latest"');
+    expect(service).toContain('"sync"');
+    // systemd parses ExecStart itself — must NOT carry shell single-quotes.
+    expect(service).not.toContain("'whoburnedmore@latest'");
+  });
+
+  it("builds a timer on the 15min cadence that survives reboots", () => {
+    const timer = buildSystemdTimer();
+    expect(timer).toContain(`OnUnitActiveSec=${SYNC_INTERVAL_MINUTES}min`);
+    expect(timer).toContain("Persistent=true");
+    expect(timer).toContain("WantedBy=timers.target");
+  });
+
+  it("quotes systemd ExecStart args, escaping backslashes and quotes", () => {
+    expect(systemdQuote("plain")).toBe('"plain"');
+    expect(systemdQuote('a"b')).toBe('"a\\"b"');
+    expect(systemdQuote("a\\b")).toBe('"a\\\\b"');
+  });
+
+  it("drift-detects a stale systemd interval the same way the plist path does", () => {
+    // The reconcile machinery compares installed-vs-expected content; a timer
+    // frozen at an old cadence must read as drift so heal-on-run rewrites it.
+    const expected = `${buildSystemdService(syncCommandArgs("/usr/local/bin/npm"))}\n${buildSystemdTimer(15)}`;
+    const stale = `${buildSystemdService(syncCommandArgs("/usr/local/bin/npm"))}\n${buildSystemdTimer(60)}`;
+    expect(stale).not.toBe(expected);
+    expect(plistDrift(stale, expected)).toBe("drift");
+    expect(plistDrift(expected, expected)).toBe("ok");
+    expect(reconcileAction(plistDrift(stale, expected))).toBe("install");
+  });
+});
+
+describe("notifyLaunchLive", () => {
+  it("uses macOS notification center to send the launch message", () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const ok = notifyLaunchLive({
+      platform: "darwin",
+      spawn: (cmd, args) => {
+        calls.push({ cmd, args });
+        return { status: 0 };
+      },
+    });
+    expect(ok).toBe(true);
+    expect(calls[0].cmd).toBe("osascript");
+    expect(calls[0].args.join(" ")).toContain("whoburnedmore.com");
+  });
+
+  it("falls back cleanly when no desktop notifier is available", () => {
+    const ok = notifyLaunchLive({
+      platform: "linux",
+      spawn: () => ({ status: 1 }),
+    });
+    expect(ok).toBe(false);
+  });
+
+  it("uses built-in PowerShell APIs on Windows", () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const ok = notifyLaunchLive({
+      platform: "win32",
+      spawn: (cmd, args) => {
+        calls.push({ cmd, args });
+        return { status: 0 };
+      },
+    });
+
+    expect(ok).toBe(true);
+    expect(calls[0].cmd).toBe("powershell");
+    expect(calls[0].args.join(" ")).toContain("System.Windows.Forms");
+    expect(calls[0].args.join(" ")).not.toContain("BurntToast");
   });
 });
 
@@ -80,8 +222,40 @@ describe("resolveNodePath (stable node path)", () => {
   });
 });
 
+describe("resolveNpmPath (stable npm path)", () => {
+  it("prefers a stable npm symlink", () => {
+    const got = resolveNpmPath({
+      candidates: ["/opt/homebrew/bin/npm"],
+      check: (p) => p === "/opt/homebrew/bin/npm",
+      execPath: "/opt/homebrew/Cellar/node/25.9.0_2/bin/node",
+    });
+    expect(got).toBe("/opt/homebrew/bin/npm");
+    expect(got).not.toContain("/Cellar/");
+  });
+
+  it("falls back to npm next to the current node executable", () => {
+    const got = resolveNpmPath({
+      candidates: ["/missing/npm"],
+      check: (p) => p === "/some/runtime/npm",
+      execPath: "/some/runtime/node",
+      platform: "linux",
+    });
+    expect(got).toBe("/some/runtime/npm");
+  });
+
+  it("uses npm.cmd next to node.exe on Windows", () => {
+    const got = resolveNpmPath({
+      candidates: [],
+      check: (p) => p.endsWith("\\npm.cmd"),
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      platform: "win32",
+    });
+    expect(got).toBe("C:\\Program Files\\nodejs\\npm.cmd");
+  });
+});
+
 describe("plistDrift + reconcileAction (content drift reconciliation)", () => {
-  const expected = buildLaunchdPlist("/usr/local/bin/node", "/cli.js");
+  const expected = buildLaunchdPlist(syncCommandArgs("/usr/local/bin/npm"));
 
   it("reports absent (→ install) when nothing is installed", () => {
     expect(plistDrift(null, expected)).toBe("absent");
@@ -102,8 +276,8 @@ describe("plistDrift + reconcileAction (content drift reconciliation)", () => {
 
   it("reports drift for a dead version-pinned Cellar node path", () => {
     const stale = expected.replace(
-      "/usr/local/bin/node",
-      "/opt/homebrew/Cellar/node/25.9.0_2/bin/node",
+      "/usr/local/bin/npm",
+      "/opt/homebrew/Cellar/node/25.9.0_2/bin/npm",
     );
     expect(plistDrift(stale, expected)).toBe("drift");
   });

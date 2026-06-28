@@ -7,31 +7,43 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import pc from "picocolors";
 import type { SubmitPayload } from "./shared.js";
-import { parseBoard, resolveCommand } from "./args.js";
+import {
+  applyScope,
+  parseBoard,
+  parseInstallToken,
+  parseOrg,
+  parsePass,
+  resolveCommand,
+} from "./args.js";
 import {
   anonSubmit,
   anonRemove,
   anonVisibility,
-  boardClaimUrl,
-  claimUrl,
+  resolveOpenTarget,
   apiBase,
   webBase,
   isTrustedWebUrl,
   isOpenableUrl,
+  redeemServerInstall,
 } from "./api.js";
 import {
   autoSyncInstalled,
   installAutoSync,
+  notifyLaunchLive,
   reconcileAutoSync,
   rotateLogIfLarge,
+  syncIntervalLabel,
+  SYNC_INTERVAL_MINUTES,
   uninstallAutoSync,
 } from "./autosync.js";
 import { printBanner } from "./banner.js";
+import { daemonLoop } from "./daemon.js";
 import { collectAll, type ProgressFn } from "./collect.js";
 import {
   defaultConfigDir,
   ensureAnonKey,
   loadConfig,
+  recordLaunchNotificationDelivered,
   recordSync,
 } from "./config.js";
 import { agentStatusReport } from "./status.js";
@@ -149,6 +161,10 @@ interface Flags {
   quiet: boolean;
   /** Friends-board code from `--board=<code>`: join it on submit and compare. */
   board?: string;
+  /** Organization slug from `--org=<slug>`: join it on submit. */
+  org?: string;
+  /** Org join password from `--pass=<code>` / `--code=<code>`: gates the org join. */
+  orgCode?: string;
 }
 
 /** Render the standalone local dashboard to the config dir and open it. */
@@ -196,7 +212,7 @@ async function run(flags: Flags): Promise<void> {
   } finally {
     progress.stop();
   }
-  const { entries, sessions, blocks, tools, skills, projects, agent, attributionComplete } =
+  const { entries, sessions, blocks, tools, skills, agent, attributionComplete } =
     collected;
   if (entries.length === 0) {
     console.log();
@@ -206,17 +222,20 @@ async function run(flags: Flags): Promise<void> {
   }
 
   const payload: SubmitPayload = { cliVersion: VERSION, entries };
+  // ccusage dates usage in the machine's LOCAL timezone, so report that zone's
+  // UTC offset (minutes east of UTC; getTimezoneOffset is the inverse sign) and
+  // let the server compute this member's daily/weekly board in their local day.
+  payload.tzOffsetMinutes = -new Date().getTimezoneOffset();
   if (sessions.length > 0) payload.sessions = sessions;
   if (blocks.length > 0) payload.blocks = blocks;
   if (tools.length > 0) payload.tools = tools;
   if (skills.length > 0) payload.skills = skills;
-  if (projects.length > 0) payload.projects = projects;
   if (agent.messageCount > 0) payload.agent = agent;
   // Tell the server the breakdown is a full snapshot (only when we actually have
   // one) so it refreshes the dashboard unconditionally instead of no-shrinking.
-  if (attributionComplete && (tools.length > 0 || skills.length > 0 || projects.length > 0))
+  if (attributionComplete && (tools.length > 0 || skills.length > 0))
     payload.attributionComplete = true;
-  if (flags.board) payload.board = flags.board;
+  applyScope(payload, flags);
 
   if (flags.dryRun) {
     console.log(pc.dim("\n  --dry-run: this exact payload would be sent, nothing else:\n"));
@@ -260,15 +279,25 @@ async function run(flags: Flags): Promise<void> {
   } catch {
     /* best-effort — never fail a submit over a freshness stamp */
   }
+  try {
+    const config = loadConfig();
+    if (result.launch?.live && !config?.launchNotificationDeliveredAt) {
+      if (notifyLaunchLive()) {
+        recordLaunchNotificationDelivered();
+      }
+    }
+  } catch {
+    /* best-effort — never fail a submit over a launch notification */
+  }
   // Take the user straight to their live page in the browser, first thing —
   // the board if they joined one, otherwise their claimable dashboard. Either
   // way we carry the claim handoff (key + slug) in the URL fragment so signing
   // in on that page claims this machine's submission instead of stranding it as
   // an anonymous row.
-  const baseUrl = result.boardUrl ?? result.dashboardUrl;
-  const target = result.boardUrl
-    ? boardClaimUrl(result.boardUrl, result.slug, anonKey)
-    : claimUrl(result.dashboardUrl, anonKey);
+  // Land the runner on the ORG board when they joined one (the brief: running the
+  // command always ends up on the org leaderboard), else a friends board, else
+  // their own dashboard — see resolveOpenTarget.
+  const { baseUrl, target } = resolveOpenTarget(result, anonKey);
   // The dashboard/board URL comes BACK from the server. Only auto-open it if it's a real
   // https URL on our own web host — a malicious or MITM'd response must never make us
   // launch an arbitrary URL/scheme/handler. Otherwise show it as text; never auto-open.
@@ -326,6 +355,108 @@ async function run(flags: Flags): Promise<void> {
   }
 }
 
+async function linkServerInstall(token: string | undefined): Promise<void> {
+  if (!token) {
+    throw new Error("missing install token — use `npx whoburnedmore link --token=<token>`");
+  }
+  const anonKey = ensureAnonKey();
+  const linked = await redeemServerInstall(token, anonKey);
+  console.log(
+    linked.alreadyLinked
+      ? `  This machine is already linked to @${linked.handle}.`
+      : `  Linked this machine to @${linked.handle}.`,
+  );
+  if (linked.mergedDays > 0) {
+    console.log(pc.dim(`  Merged ${linked.mergedDays} existing usage day${linked.mergedDays === 1 ? "" : "s"} from this machine.`));
+  }
+
+  await run({
+    dryRun: false,
+    noSubmit: false,
+    local: false,
+    quiet: true,
+  });
+
+  try {
+    const action = reconcileAutoSync();
+    if (action === "installed") {
+      console.log(pc.dim("  Background sync installed; this machine will refresh every 15 min."));
+    } else if (action === "reinstalled") {
+      console.log(pc.dim("  Background sync repaired; this machine will refresh every 15 min."));
+    } else {
+      console.log(pc.dim("  Background sync is already configured."));
+    }
+  } catch {
+    console.log(pc.dim("  Linked, but background sync could not be installed automatically. Run `npx whoburnedmore install-sync` to retry."));
+  }
+
+  console.log(`  Profile: ${linked.profileUrl}`);
+}
+
+/** Sleep for `ms`, resolving early if `signal` aborts (prompt SIGTERM exit). */
+function waitOrAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Foreground sync loop for VMs/containers without a usable OS scheduler. Runs a
+ * quiet collect+submit immediately, then every 15 min, until SIGINT/SIGTERM —
+ * the portable way to keep a server on the leaderboard when cron/launchd/systemd
+ * aren't an option. Meant to be supervised (systemd service, Docker CMD, pm2,
+ * nohup); set WHOBURNEDMORE_CONFIG_DIR to a persistent path so the machine
+ * identity survives container restarts.
+ */
+async function runDaemon(): Promise<void> {
+  // A fresh VM may go straight to `daemon` without ever running once, so make
+  // sure this machine has an identity to own its dashboard.
+  ensureAnonKey();
+
+  const controller = new AbortController();
+  const onSignal = () => controller.abort();
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+
+  console.log(pc.bold("  whoburnedmore daemon"));
+  console.log(
+    pc.dim(
+      `  Syncing in the foreground every ${syncIntervalLabel()} — run this under systemd, a Docker CMD, pm2 or nohup to keep a server on the leaderboard. Ctrl-C to stop.`,
+    ),
+  );
+  if (!process.env.WHOBURNEDMORE_CONFIG_DIR) {
+    console.log(
+      pc.dim(
+        "  Tip: set WHOBURNEDMORE_CONFIG_DIR to a persistent path so this machine's identity survives container/VM restarts.",
+      ),
+    );
+  }
+  console.log();
+
+  const cycles = await daemonLoop({
+    intervalMs: SYNC_INTERVAL_MINUTES * 60_000,
+    isStopped: () => controller.signal.aborted,
+    log: (line) => console.log(`  ${pc.dim(new Date().toISOString())}  ${line}`),
+    wait: (ms) => waitOrAbort(ms, controller.signal),
+    runOnce: async () => {
+      rotateLogIfLarge();
+      await run({ dryRun: false, noSubmit: false, local: false, quiet: true });
+    },
+  });
+
+  console.log();
+  console.log(pc.dim(`  Daemon stopped after ${cycles} sync cycle${cycles === 1 ? "" : "s"}.`));
+}
+
 async function main(): Promise<void> {
   const major = Number(process.versions.node.split(".")[0]);
   if (major < 20) {
@@ -334,13 +465,21 @@ async function main(): Promise<void> {
     return;
   }
   const args = process.argv.slice(2);
-  const command = resolveCommand(args);
+  const baseCommand = resolveCommand(args);
+  // `--watch` on a run/sync promotes to the long-running daemon, so a server can
+  // start it the same way it'd start a one-off (`whoburnedmore sync --watch`).
+  const command =
+    args.includes("--watch") && (baseCommand === "run" || baseCommand === "sync")
+      ? "daemon"
+      : baseCommand;
   const flags: Flags = {
     dryRun: args.includes("--dry-run"),
     noSubmit: args.includes("--no-submit"),
     local: args.includes("--local"),
     quiet: command === "sync",
     board: parseBoard(args),
+    org: parseOrg(args),
+    orgCode: parsePass(args),
   };
 
   switch (command) {
@@ -356,6 +495,12 @@ async function main(): Promise<void> {
       await run({ ...flags, noSubmit: false, dryRun: false, local: false });
       break;
     }
+    case "link":
+      await linkServerInstall(parseInstallToken(args));
+      break;
+    case "daemon":
+      await runDaemon();
+      break;
     case "status":
     case "doctor": {
       for (const line of agentStatusReport()) console.log(line);
@@ -412,9 +557,12 @@ function printHelp(): void {
   ${pc.bold("usage")}
     npx whoburnedmore              burn + land on the public leaderboard, open your dashboard
     npx whoburnedmore --board=CODE compare with friends — join their board (no sign-in)
+    npx whoburnedmore --org=SLUG   submit to your organization's board (companies/hackathons)
     npx whoburnedmore --local      build the dashboard on your machine and open it (offline)
     npx whoburnedmore --dry-run    print exactly what would be sent, send nothing
     npx whoburnedmore --no-submit  collect locally, send nothing (no dashboard)
+    npx whoburnedmore link --token=TOKEN  link this server/VM to your signed-in account
+    npx whoburnedmore daemon       keep syncing in the foreground (VMs/containers with no cron)
     npx whoburnedmore private      hide your dashboard from the leaderboard
     npx whoburnedmore public       put it back on the leaderboard
     npx whoburnedmore remove       delete your dashboard and its data
@@ -429,6 +577,14 @@ function printHelp(): void {
   daily aggregate numbers (date, tool, model, token counts, est. cost) ever leave
   your machine — never prompts, code, or file names. With --local, nothing leaves
   your machine at all.
+
+  ${pc.bold("servers & VMs")}
+    Generate a one-time \`link\` command from your profile on whoburnedmore.com and
+    run it inside the VM to bind that machine to your account. On a persistent VM
+    background sync uses cron or a systemd user timer automatically; in a container
+    or any host without a scheduler, run \`whoburnedmore daemon\` under your process
+    manager instead. Set WHOBURNEDMORE_CONFIG_DIR to a persistent path so the
+    machine identity survives restarts. See docs/SERVER-VM-SETUP.md.
 `);
 }
 

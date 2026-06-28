@@ -38,11 +38,15 @@ npx whoburnedmore private      hide your dashboard from the leaderboard
 npx whoburnedmore public       put it back
 npx whoburnedmore remove       delete your dashboard and its data
 npx whoburnedmore status       check background-sync health
+npx whoburnedmore install-sync     turn on 15-minute background sync
 npx whoburnedmore uninstall-sync   turn off the background sync
 ```
 
 After your first run, a background sync keeps your page fresh automatically
-(`uninstall-sync` to stop). The server endpoint is overridable with `WHOBURNEDMORE_API`.
+every 15 minutes (`uninstall-sync` to stop). The installed background job runs
+the latest published `whoburnedmore` package on each sync tick, so future CLI
+fixes are picked up automatically after the next refresh. The server endpoint is
+overridable with `WHOBURNEDMORE_API`.
 
 ## Privacy & transparency
 

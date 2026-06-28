@@ -8,7 +8,6 @@ import type {
   AgentStat,
   BlockEntry,
   DailyUsageEntry,
-  ProjectStat,
   SessionEntry,
   SkillStat,
   ToolStat,
@@ -222,8 +221,6 @@ export interface CollectResult {
   tools: ToolStat[];
   /** Skill-usage frequencies parsed from local transcripts. */
   skills: SkillStat[];
-  /** Per-project usage totals parsed from local transcripts. */
-  projects: ProjectStat[];
   /** Subagent-vs-main rollup parsed from local transcripts. */
   agent: AgentStat;
   /** True when transcript scanning finished within its time budget (full snapshot). */
@@ -393,10 +390,10 @@ export async function collectAll(onProgress?: ProgressFn): Promise<CollectResult
     tick();
     return c;
   });
-  // Tool/skill/project/subagent rollups from Claude Code transcripts (ccusage
-  // can't see these). Async + yielding, so the loading bar keeps moving while it
-  // scans. Titles + per-session message counts join onto the session rollups by
-  // sessionId (ccusage's session id is the transcript uuid).
+  // Tool/skill/subagent rollups from Claude Code transcripts (ccusage can't see
+  // these). Async + yielding, so the loading bar keeps moving while it scans.
+  // Per-session message counts join onto the session rollups by sessionId
+  // (ccusage's session id is the transcript uuid).
   const attributionTask = collectAttribution().then((a) => {
     tick();
     return a;
@@ -425,15 +422,13 @@ export async function collectAll(onProgress?: ProgressFn): Promise<CollectResult
     toolsFound.push("cursor");
   }
 
-  const { tools, skills, projects, agent, titles, sessionMessages, complete } = attribution;
+  const { tools, skills, agent, sessionMessages, complete } = attribution;
   onProgress?.(COLLECT_STAGES, COLLECT_STAGES, "");
 
   const dedupedSessions = dedupeSessions(sessions).map((s) => {
-    const title = titles.get(s.sessionId);
     const messageCount = sessionMessages.get(s.sessionId);
     return {
       ...s,
-      ...(title ? { title } : {}),
       ...(messageCount ? { messageCount } : {}),
     };
   });
@@ -443,14 +438,13 @@ export async function collectAll(onProgress?: ProgressFn): Promise<CollectResult
     // schema: entries ≤ 20000, sessions/blocks ≤ 10000), keeping the
     // highest-token rows. Without this, a power user with >10000 distinct sessions
     // would have their ENTIRE submit rejected with a 400 instead of a capped one.
-    // tools/skills/projects are already bounded upstream (attribution caps).
+    // tools/skills are already bounded upstream (attribution caps).
     entries: capByTokens(dedupeDaily(entries), 20000, entryTokens),
     sessions: capByTokens(dedupedSessions, 10000, entryTokens),
     blocks: capByTokens(dedupeBlocks(blocks), 10000, (b) => b.totalTokens),
     toolsFound,
     tools,
     skills,
-    projects,
     agent,
     attributionComplete: complete,
   };

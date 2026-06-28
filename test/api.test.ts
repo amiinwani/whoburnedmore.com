@@ -7,6 +7,8 @@ import {
   claimUrl,
   isOpenableUrl,
   isTrustedWebUrl,
+  redeemServerInstall,
+  resolveOpenTarget,
 } from "../src/api.js";
 
 describe("isTrustedWebUrl — never auto-open a hostile server URL", () => {
@@ -86,6 +88,54 @@ describe("boardClaimUrl", () => {
   });
 });
 
+describe("resolveOpenTarget — a run with --org lands on the org board", () => {
+  const anonKey = "deadbeefcafef00d";
+  it("opens the ORG board (with claim handoff) when the server returned one", () => {
+    const { baseUrl, target } = resolveOpenTarget(
+      {
+        orgBoardUrl: "https://whoburnedmore.com/o/inventionnovelty/board",
+        dashboardUrl: "https://whoburnedmore.com/d/cool-fox-12",
+        slug: "cool-fox-12",
+      },
+      anonKey,
+    );
+    expect(baseUrl).toBe("https://whoburnedmore.com/o/inventionnovelty/board");
+    expect(target).toContain("/o/inventionnovelty/board");
+    expect(target).toContain(`#k=${anonKey}`);
+  });
+  it("prefers the org board over a friends board", () => {
+    const { target } = resolveOpenTarget(
+      {
+        orgBoardUrl: "https://whoburnedmore.com/o/acme/board",
+        boardUrl: "https://whoburnedmore.com/boards/xyz",
+        dashboardUrl: "https://whoburnedmore.com/d/cool-fox-12",
+        slug: "cool-fox-12",
+      },
+      anonKey,
+    );
+    expect(target).toContain("/o/acme/board");
+    expect(target).not.toContain("/boards/xyz");
+  });
+  it("falls back to friends board, then the dashboard claim URL", () => {
+    expect(
+      resolveOpenTarget(
+        {
+          boardUrl: "https://whoburnedmore.com/boards/xyz",
+          dashboardUrl: "https://whoburnedmore.com/d/cool-fox-12",
+          slug: "cool-fox-12",
+        },
+        anonKey,
+      ).target,
+    ).toContain("/boards/xyz");
+    expect(
+      resolveOpenTarget(
+        { dashboardUrl: "https://whoburnedmore.com/d/cool-fox-12", slug: "cool-fox-12" },
+        anonKey,
+      ).target,
+    ).toContain("/d/cool-fox-12");
+  });
+});
+
 describe("anon visibility + remove", () => {
   afterEach(() => vi.unstubAllGlobals());
 
@@ -125,6 +175,49 @@ describe("anon visibility + remove", () => {
       ),
     );
     await expect(anonRemove("k".repeat(32))).rejects.toThrow("nope");
+  });
+});
+
+describe("server install redeem", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("POSTs the one-time install token with this machine's anon key", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            handle: "alice",
+            profileUrl: "https://whoburnedmore.com/u/alice",
+            mergedDays: 0,
+            alreadyLinked: false,
+          }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await redeemServerInstall("tok.secret", "k".repeat(32));
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toMatch(/\/v1\/server-install\/redeem$/);
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({
+      token: "tok.secret",
+      anonKey: "k".repeat(32),
+    });
+    expect(result.handle).toBe("alice");
+  });
+
+  it("throws the server error on rejected links", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: "already linked" }), { status: 409 }),
+      ),
+    );
+    await expect(
+      redeemServerInstall("tok.secret", "k".repeat(32)),
+    ).rejects.toThrow("already linked");
   });
 });
 

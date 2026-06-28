@@ -9,8 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, win32 } from "node:path";
 import { defaultConfigDir } from "./config.js";
 
 /**
@@ -42,6 +41,14 @@ const STABLE_NODE_CANDIDATES = [
   "/usr/bin/node",
 ];
 
+const STABLE_NPM_CANDIDATES = [
+  "/opt/homebrew/bin/npm",
+  "/usr/local/bin/npm",
+  "/usr/bin/npm",
+];
+
+const LATEST_PACKAGE_SPEC = "whoburnedmore@latest";
+
 /**
  * Log inside the user's own config dir, not /tmp — a fixed /tmp path could
  * be pre-created as a symlink by another local user.
@@ -51,10 +58,12 @@ export function syncLogPath(): string {
 }
 
 export function buildLaunchdPlist(
-  nodePath: string,
-  scriptPath: string,
+  commandArgs: string[] = syncCommandArgs(),
   logPath: string = syncLogPath(),
 ): string {
+  const programArguments = commandArgs
+    .map((arg) => `    <string>${xmlEscape(arg)}</string>`)
+    .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -63,9 +72,7 @@ export function buildLaunchdPlist(
   <string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodePath}</string>
-    <string>${scriptPath}</string>
-    <string>sync</string>
+${programArguments}
   </array>
   <key>StartInterval</key>
   <integer>${SYNC_INTERVAL_MINUTES * 60}</integer>
@@ -78,9 +85,9 @@ export function buildLaunchdPlist(
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
-  <string>${logPath}</string>
+  <string>${xmlEscape(logPath)}</string>
   <key>StandardErrorPath</key>
-  <string>${logPath}</string>
+  <string>${xmlEscape(logPath)}</string>
 </dict>
 </plist>
 `;
@@ -88,10 +95,6 @@ export function buildLaunchdPlist(
 
 function launchAgentPath(): string {
   return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
-}
-
-function cliScriptPath(): string {
-  return fileURLToPath(new URL("./index.js", import.meta.url));
 }
 
 /** True if `p` exists and runs `node -v` reporting major >= 20. */
@@ -123,9 +126,75 @@ export function resolveNodePath(opts?: {
   return execPath;
 }
 
+function isUsableNpm(p: string): boolean {
+  if (!existsSync(p)) return false;
+  const res = spawnSync(p, ["--version"], { encoding: "utf8" });
+  return res.status === 0;
+}
+
+export function resolveNpmPath(opts?: {
+  candidates?: string[];
+  check?: (p: string) => boolean;
+  execPath?: string;
+  platform?: NodeJS.Platform | string;
+}): string {
+  const candidates = opts?.candidates ?? STABLE_NPM_CANDIDATES;
+  const check = opts?.check ?? isUsableNpm;
+  const execPath = opts?.execPath ?? process.execPath;
+  const os = opts?.platform ?? platform();
+  for (const c of candidates) {
+    if (check(c)) return c;
+  }
+
+  const sibling = os === "win32"
+    ? win32.join(win32.dirname(execPath), "npm.cmd")
+    : join(dirname(execPath), "npm");
+  if (check(sibling)) return sibling;
+
+  return os === "win32" ? "npm.cmd" : "npm";
+}
+
+export function syncCommandArgs(npmPath: string = resolveNpmPath()): string[] {
+  return [
+    npmPath,
+    "exec",
+    "--yes",
+    "--ignore-scripts",
+    "--package",
+    LATEST_PACKAGE_SPEC,
+    "--",
+    "whoburnedmore",
+    "sync",
+  ];
+}
+
+export function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&apos;")
+    .replaceAll(">", "&gt;");
+}
+
+export function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function windowsQuote(value: string): string {
+  const escaped = value
+    .replace(/(\\*)"/g, "$1$1\\\"")
+    .replace(/\\+$/g, (slashes) => `${slashes}${slashes}`);
+  return `"${escaped}"`;
+}
+
+export function windowsCommandLine(args: string[]): string {
+  return args.map(windowsQuote).join(" ");
+}
+
 /** The exact launchd plist this machine *should* have right now (darwin). */
 export function expectedDarwinPlist(): string {
-  return buildLaunchdPlist(resolveNodePath(), cliScriptPath());
+  return buildLaunchdPlist(syncCommandArgs());
 }
 
 export type DriftState = "absent" | "drift" | "ok";
@@ -159,19 +228,18 @@ export function installAutoSync(): string {
     return `launchd agent installed (${plistPath}), syncing every ${syncIntervalLabel()}`;
   }
   if (os === "linux") {
-    const line = expectedLinuxCronLine();
-    const current = spawnSync("crontab", ["-l"], { encoding: "utf8" });
-    const existing = current.status === 0 ? current.stdout : "";
-    // Drop any prior whoburnedmore line so an interval/path change actually
-    // re-applies instead of leaving a stale entry behind (content reconciliation).
-    const kept = existing
-      .split("\n")
-      .filter((l) => !l.includes("whoburnedmore"))
-      .join("\n");
-    const next = `${kept.trimEnd()}\n${line}\n`.replace(/^\n+/, "");
-    const res = spawnSync("crontab", ["-"], { input: next });
-    if (res.status !== 0) throw new Error("could not install crontab entry");
-    return `cron entry installed, syncing every ${syncIntervalLabel()}`;
+    // Prefer cron (reconciled by content below); fall back to a systemd user
+    // timer for the many VMs/containers that ship without crontab. If neither
+    // is available, point the user at the portable foreground daemon instead of
+    // dying silently — on a server that's the difference between tracking and not.
+    const viaCron = tryInstallCron();
+    if (viaCron) return viaCron;
+    const viaSystemd = tryInstallSystemd();
+    if (viaSystemd) return viaSystemd;
+    throw new Error(
+      "could not install background sync: no usable crontab or systemd user timer. " +
+        "Run `whoburnedmore daemon` under your process manager (systemd service, Docker CMD, pm2 or nohup) to keep syncing.",
+    );
   }
   if (os === "win32") {
     const res = spawnSync("schtasks", [
@@ -179,7 +247,7 @@ export function installAutoSync(): string {
       "/SC", "MINUTE",
       "/MO", String(SYNC_INTERVAL_MINUTES),
       "/TN", "whoburnedmore-sync",
-      "/TR", `"${resolveNodePath()}" "${cliScriptPath()}" sync`,
+      "/TR", windowsCommandLine(syncCommandArgs()),
     ]);
     if (res.status !== 0) throw new Error("could not create scheduled task");
     return `scheduled task installed, syncing every ${syncIntervalLabel()}`;
@@ -193,8 +261,134 @@ export function cronSchedule(mins: number = SYNC_INTERVAL_MINUTES): string {
 }
 
 /** The exact crontab line this machine should have right now (linux). */
-export function expectedLinuxCronLine(): string {
-  return `${cronSchedule()} "${resolveNodePath()}" "${cliScriptPath()}" sync >"${syncLogPath()}" 2>&1`;
+export function expectedLinuxCronLine(opts?: {
+  npmPath?: string;
+  logPath?: string;
+}): string {
+  const command = syncCommandArgs(opts?.npmPath)
+    .map(shellQuote)
+    .join(" ");
+  return `${cronSchedule()} ${command} >${shellQuote(opts?.logPath ?? syncLogPath())} 2>&1`;
+}
+
+// --- systemd user-timer fallback (linux) ---------------------------------
+//
+// Many real VMs and most containers ship without a crontab binary (or a
+// running cron daemon), so the cron path above silently buys nothing there.
+// When cron is unavailable we fall back to a systemd *user* timer, which is
+// present on virtually every modern Linux distro's default install. It is a
+// genuine second mechanism, so the drift/reconcile machinery below is taught to
+// recognise whichever one is actually installed and only heal that one.
+
+const SYSTEMD_UNIT = "whoburnedmore-sync";
+
+/** `~/.config/systemd/user`, honouring XDG_CONFIG_HOME the way systemd does. */
+export function systemdUserDir(): string {
+  const base = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config");
+  return join(base, "systemd", "user");
+}
+export function systemdServicePath(): string {
+  return join(systemdUserDir(), `${SYSTEMD_UNIT}.service`);
+}
+export function systemdTimerPath(): string {
+  return join(systemdUserDir(), `${SYSTEMD_UNIT}.timer`);
+}
+
+/**
+ * systemd parses ExecStart with its OWN rules (not a shell): whitespace splits
+ * args, double quotes group, backslash escapes. So shell single-quoting is
+ * wrong here — wrap each arg in double quotes and escape `\` and `"`.
+ */
+export function systemdQuote(value: string): string {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
+}
+
+export function buildSystemdService(commandArgs: string[] = syncCommandArgs()): string {
+  const execStart = commandArgs.map(systemdQuote).join(" ");
+  return `[Unit]
+Description=whoburnedmore background token-usage sync
+
+[Service]
+Type=oneshot
+ExecStart=${execStart}
+`;
+}
+
+export function buildSystemdTimer(mins: number = SYNC_INTERVAL_MINUTES): string {
+  return `[Unit]
+Description=whoburnedmore background token-usage sync timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${mins}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+`;
+}
+
+/** True if `cmd` resolves to an executable (no ENOENT when spawned). */
+function binaryExists(cmd: string, probeArgs: string[] = ["--version"]): boolean {
+  const res = spawnSync(cmd, probeArgs, { stdio: "ignore" });
+  return !res.error;
+}
+
+/**
+ * Which linux mechanism currently owns the background sync, by inspection:
+ * a `whoburnedmore` crontab line, or our installed systemd timer file, or none.
+ * Cron wins when both are somehow present (it's the primary).
+ */
+export function linuxSyncMechanism(): "cron" | "systemd" | "none" {
+  const cron = spawnSync("crontab", ["-l"], { encoding: "utf8" });
+  if (!cron.error && cron.status === 0 && cron.stdout.includes("whoburnedmore")) {
+    return "cron";
+  }
+  if (existsSync(systemdTimerPath())) return "systemd";
+  return "none";
+}
+
+/** Install the cron entry; returns a description, or null if cron is unusable. */
+function tryInstallCron(): string | null {
+  if (!binaryExists("crontab", ["-l"])) return null;
+  const line = expectedLinuxCronLine();
+  const current = spawnSync("crontab", ["-l"], { encoding: "utf8" });
+  const existing = current.status === 0 ? current.stdout : "";
+  const kept = existing
+    .split("\n")
+    .filter((l) => !l.includes("whoburnedmore"))
+    .join("\n");
+  const next = `${kept.trimEnd()}\n${line}\n`.replace(/^\n+/, "");
+  const res = spawnSync("crontab", ["-"], { input: next });
+  if (res.status !== 0) return null;
+  return `cron entry installed, syncing every ${syncIntervalLabel()}`;
+}
+
+/** Install a systemd user timer; returns a description, or null if unusable. */
+function tryInstallSystemd(): string | null {
+  if (!binaryExists("systemctl", ["--user", "--version"])) return null;
+  try {
+    mkdirSync(systemdUserDir(), { recursive: true });
+    writeFileSync(systemdServicePath(), buildSystemdService());
+    writeFileSync(systemdTimerPath(), buildSystemdTimer());
+  } catch {
+    return null;
+  }
+  spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
+  const res = spawnSync(
+    "systemctl",
+    ["--user", "enable", "--now", `${SYSTEMD_UNIT}.timer`],
+    { stdio: "ignore" },
+  );
+  if (res.status !== 0) {
+    // Files are written but the timer couldn't be enabled (e.g. no user DBus on
+    // a bare container). Roll back so drift detection doesn't think a working
+    // systemd timer exists.
+    rmSync(systemdServicePath(), { force: true });
+    rmSync(systemdTimerPath(), { force: true });
+    return null;
+  }
+  return `systemd user timer installed, syncing every ${syncIntervalLabel()} (run \`loginctl enable-linger\` to keep syncing while logged out)`;
 }
 
 export function uninstallAutoSync(): string {
@@ -208,15 +402,28 @@ export function uninstallAutoSync(): string {
     return "launchd agent removed";
   }
   if (os === "linux") {
+    let removed = false;
     const current = spawnSync("crontab", ["-l"], { encoding: "utf8" });
-    if (current.status === 0 && current.stdout.includes("whoburnedmore")) {
+    if (!current.error && current.status === 0 && current.stdout.includes("whoburnedmore")) {
       const next = current.stdout
         .split("\n")
         .filter((l) => !l.includes("whoburnedmore"))
         .join("\n");
       spawnSync("crontab", ["-"], { input: next });
+      removed = true;
     }
-    return "cron entry removed";
+    if (existsSync(systemdTimerPath())) {
+      spawnSync(
+        "systemctl",
+        ["--user", "disable", "--now", `${SYSTEMD_UNIT}.timer`],
+        { stdio: "ignore" },
+      );
+      rmSync(systemdServicePath(), { force: true });
+      rmSync(systemdTimerPath(), { force: true });
+      spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
+      removed = true;
+    }
+    return removed ? "background sync removed" : "nothing to remove";
   }
   if (os === "win32") {
     spawnSync("schtasks", ["/Delete", "/F", "/TN", "whoburnedmore-sync"]);
@@ -228,8 +435,7 @@ export function uninstallAutoSync(): string {
 export function autoSyncInstalled(): boolean {
   if (platform() === "darwin") return existsSync(launchAgentPath());
   if (platform() === "linux") {
-    const current = spawnSync("crontab", ["-l"], { encoding: "utf8" });
-    return current.status === 0 && current.stdout.includes("whoburnedmore");
+    return linuxSyncMechanism() !== "none";
   }
   if (platform() === "win32") {
     const res = spawnSync("schtasks", ["/Query", "/TN", "whoburnedmore-sync"], {
@@ -240,6 +446,20 @@ export function autoSyncInstalled(): boolean {
   return false;
 }
 
+/** The installed systemd unit+timer content concatenated, or null if absent. */
+function readInstalledSystemd(): string | null {
+  try {
+    return `${readFileSync(systemdServicePath(), "utf8")}\n${readFileSync(systemdTimerPath(), "utf8")}`;
+  } catch {
+    return null;
+  }
+}
+
+/** What a correctly-installed systemd unit+timer should look like right now. */
+function expectedSystemd(): string {
+  return `${buildSystemdService()}\n${buildSystemdTimer()}`;
+}
+
 /** Read the currently-installed agent config as a string, or null if absent. */
 function readInstalledAgent(): string | null {
   if (platform() === "darwin") {
@@ -247,12 +467,16 @@ function readInstalledAgent(): string | null {
     return existsSync(p) ? readFileSync(p, "utf8") : null;
   }
   if (platform() === "linux") {
-    const current = spawnSync("crontab", ["-l"], { encoding: "utf8" });
-    if (current.status !== 0) return null;
-    const line = current.stdout
-      .split("\n")
-      .find((l) => l.includes("whoburnedmore"));
-    return line ?? null;
+    // Read back whichever mechanism is actually installed so drift compares
+    // like-for-like (and a systemd-only host isn't perpetually seen as "absent").
+    const mech = linuxSyncMechanism();
+    if (mech === "cron") {
+      const current = spawnSync("crontab", ["-l"], { encoding: "utf8" });
+      if (current.error || current.status !== 0) return null;
+      return current.stdout.split("\n").find((l) => l.includes("whoburnedmore")) ?? null;
+    }
+    if (mech === "systemd") return readInstalledSystemd();
+    return null;
   }
   return null;
 }
@@ -260,7 +484,11 @@ function readInstalledAgent(): string | null {
 /** What the installed agent *should* be on this platform, for drift comparison. */
 function expectedAgent(): string | null {
   if (platform() === "darwin") return expectedDarwinPlist();
-  if (platform() === "linux") return expectedLinuxCronLine();
+  if (platform() === "linux") {
+    // Compare against the mechanism in play; an absent install defaults to the
+    // cron target (install() tries cron first, then systemd).
+    return linuxSyncMechanism() === "systemd" ? expectedSystemd() : expectedLinuxCronLine();
+  }
   return null;
 }
 
@@ -302,6 +530,50 @@ export function rotateLogIfLarge(
   } catch {
     return false;
   }
+}
+
+export function notifyLaunchLive(opts?: {
+  platform?: NodeJS.Platform | string;
+  spawn?: (cmd: string, args: string[]) => { status: number | null };
+}): boolean {
+  const os = opts?.platform ?? platform();
+  const run = opts?.spawn ?? ((cmd, args) => spawnSync(cmd, args, { stdio: "ignore" }));
+  const title = "whoburnedmore is live";
+  const message = "Your dashboard is ready. Go to whoburnedmore.com";
+
+  if (os === "darwin") {
+    return (
+      run("osascript", [
+        "-e",
+        `display notification "${message}" with title "${title}"`,
+      ]).status === 0
+    );
+  }
+  if (os === "linux") {
+    return run("notify-send", [title, message]).status === 0;
+  }
+  if (os === "win32") {
+    const psQuote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+    const script = [
+      "Add-Type -AssemblyName System.Windows.Forms",
+      "$n = New-Object System.Windows.Forms.NotifyIcon",
+      "$n.Icon = [System.Drawing.SystemIcons]::Application",
+      `$n.BalloonTipTitle = ${psQuote(title)}`,
+      `$n.BalloonTipText = ${psQuote(message)}`,
+      "$n.Visible = $true",
+      "$n.ShowBalloonTip(10000)",
+      "Start-Sleep -Seconds 2",
+      "$n.Dispose()",
+    ].join("; ");
+    return (
+      run("powershell", [
+        "-NoProfile",
+        "-Command",
+        script,
+      ]).status === 0
+    );
+  }
+  return false;
 }
 
 /** True if the launchd/cron/schtasks job is currently loaded with the scheduler. */

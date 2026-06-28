@@ -80,25 +80,6 @@ describe("countRecord", () => {
   });
 });
 
-describe("processRecord — per-project usage", () => {
-  it("accumulates tokens + estimated cost by cwd basename", () => {
-    const acc = createAccumulator();
-    const ctx = createFileContext();
-    processRecord(assistant(), acc, ctx);
-    processRecord(assistant({ cwd: "/home/dev/project-beta" }), acc, ctx);
-    processRecord(assistant(), acc, ctx);
-    const { projects } = accumulatorToResult(acc);
-    const tokens = (n: string) => projects.find((p) => p.name === n)!.tokens;
-    expect(tokens("project-alpha")).toBe(400); // 2 × (100+50+10+40)
-    expect(tokens("project-beta")).toBe(200);
-    // opus pricing: in 15, out 75, cacheWrite 18.75, cacheRead 1.5 per 1M.
-    const tokDex = projects.find((p) => p.name === "project-alpha")!;
-    expect(tokDex.costUSD).toBeGreaterThan(0);
-    // highest-token project sorts first.
-    expect(projects[0].name).toBe("project-alpha");
-  });
-});
-
 describe("processRecord — subagent vs main split", () => {
   it("counts subagent messages + tokens separately from the total", () => {
     const acc = createAccumulator();
@@ -204,30 +185,11 @@ describe("processRecord — tool reliability (errors by tool_use_id)", () => {
   });
 });
 
-describe("processRecord — AI session titles", () => {
-  it("captures aiTitle keyed by sessionId (last wins)", () => {
-    const acc = createAccumulator();
-    const ctx = createFileContext();
-    processRecord(
-      { type: "ai-title", aiTitle: "First guess", sessionId: "s9" },
-      acc,
-      ctx,
-    );
-    processRecord(
-      { type: "ai-title", aiTitle: "Refined title", sessionId: "s9" },
-      acc,
-      ctx,
-    );
-    const { titles } = accumulatorToResult(acc);
-    expect(titles.get("s9")).toBe("Refined title");
-  });
-});
-
 describe("processCodexRecord — Codex rollout attribution", () => {
-  it("counts tool calls, splits turn tokens, and attributes the project", () => {
+  it("counts tool calls and splits turn tokens (never reads cwd)", () => {
     const acc = createAccumulator();
     const ctx = createCodexContext();
-    // session sets cwd + model
+    // session_meta carries cwd + model, which we deliberately ignore now.
     processCodexRecord(
       { type: "session_meta", payload: { cwd: "/home/dev/project-beta", model: "gpt-5.3-codex" } },
       acc,
@@ -264,11 +226,10 @@ describe("processCodexRecord — Codex rollout attribution", () => {
       acc,
       ctx,
     );
-    const { tools, projects, agent } = accumulatorToResult(acc);
+    const { tools, agent } = accumulatorToResult(acc);
     const exec = tools.find((t) => t.name === "exec_command")!;
     expect(exec.count).toBe(2);
     expect(exec.tokens).toBe(200); // 2 calls × 100 (200 split across the two)
-    expect(projects.find((p) => p.name === "project-beta")!.tokens).toBe(200);
     expect(agent.messageCount).toBe(1);
     expect(agent.totalTokens).toBe(200);
     expect(agent.subagentMessages).toBe(0); // Codex has no subagent concept

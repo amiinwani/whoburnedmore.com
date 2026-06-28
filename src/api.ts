@@ -1,5 +1,13 @@
 import type { AnonSubmitResponse, SubmitPayload } from "./shared.js";
 
+export interface ServerInstallRedeemResponse {
+  ok: true;
+  handle: string;
+  profileUrl: string;
+  mergedDays: number;
+  alreadyLinked: boolean;
+}
+
 export function apiBase(): string {
   return process.env.WHOBURNEDMORE_API ?? "https://api.whoburnedmore.com";
 }
@@ -126,6 +134,32 @@ export function boardClaimUrl(
   return `${boardUrl}#k=${encodeURIComponent(anonKey)}&u=${encodeURIComponent(slug)}`;
 }
 
+/**
+ * Decide where a finished run should send the user, and the exact URL to open.
+ * Priority: the ORG board they just joined (the brief — a run with `--org` always
+ * lands on the org leaderboard), then a friends board, then their own dashboard.
+ * The org/board URLs carry the claim handoff (#k=&u=) so a not-yet-indexed runner
+ * signs in + adds a social on arrival; the dashboard gets the plain claim handoff.
+ * Pure + unit-testable; `index.ts` opens `target` and prints `baseUrl` on distrust.
+ */
+export function resolveOpenTarget(
+  result: {
+    orgBoardUrl?: string;
+    boardUrl?: string;
+    dashboardUrl: string;
+    slug: string;
+  },
+  anonKey: string,
+): { baseUrl: string; target: string } {
+  const baseUrl = result.orgBoardUrl ?? result.boardUrl ?? result.dashboardUrl;
+  const target = result.orgBoardUrl
+    ? boardClaimUrl(result.orgBoardUrl, result.slug, anonKey)
+    : result.boardUrl
+      ? boardClaimUrl(result.boardUrl, result.slug, anonKey)
+      : claimUrl(result.dashboardUrl, anonKey);
+  return { baseUrl, target };
+}
+
 /** Show or hide this machine's anonymous dashboard on the public leaderboard. */
 export async function anonVisibility(
   anonKey: string,
@@ -151,4 +185,20 @@ export async function anonRemove(anonKey: string): Promise<void> {
     const b = (await res.json().catch(() => ({}))) as { error?: string };
     throw new Error(b.error ?? `failed (HTTP ${res.status})`);
   }
+}
+
+/** Redeem a one-time install token generated from the signed-in profile page. */
+export async function redeemServerInstall(
+  token: string,
+  anonKey: string,
+): Promise<ServerInstallRedeemResponse> {
+  const { status, body } = await post<
+    ServerInstallRedeemResponse | { error?: string }
+  >("/v1/server-install/redeem", { token, anonKey });
+  if (status !== 200) {
+    throw new Error(
+      (body as { error?: string }).error ?? `server install failed (HTTP ${status})`,
+    );
+  }
+  return body as ServerInstallRedeemResponse;
 }
