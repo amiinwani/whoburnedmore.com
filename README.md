@@ -1,208 +1,283 @@
-# whoburnedmore 🔥
-
 <div align="center">
 
-**Find out who burned more — submit your AI coding-agent token usage to the public leaderboard or run it locally!**
+<img src="assets/banner.svg" alt="whoburnedmore — see how many tokens your AI coding agents really burned" width="100%" />
 
-[![NPM Version](https://img.shields.io/npm/v/whoburnedmore.svg?style=for-the-badge&color=orange)](https://www.npmjs.com/package/whoburnedmore)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=for-the-badge)](LICENSE)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/amiinwani/whoburnedmore.com/ci.yml?branch=main&style=for-the-badge)](https://github.com/amiinwani/whoburnedmore.com/actions)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=for-the-badge)](CONTRIBUTING.md)
+<br/><br/>
 
 <p align="center">
-  <a href="#key-features">Key Features</a> •
-  <a href="#architectural-overview">Architectural Overview</a> •
-  <a href="#installation--usage">Quick Start</a> •
-  <a href="#commands">Commands</a> •
-  <a href="#advanced-configuration">Configuration</a> •
-  <a href="#privacy--security-hardening">Privacy & Security</a> •
-  <a href="#development--contribution">Contributing</a>
+  <b>Find out who burned more.</b><br/>
+  Submit your AI coding-agent token usage to the public leaderboard.
 </p>
 
-</div>
+<br/>
 
----
+<!-- Row 1: status -->
+<p align="center">
+  <a href="https://github.com/amiinwani/whoburnedmore.com/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/amiinwani/whoburnedmore.com/actions/workflows/ci.yml/badge.svg?style=flat-square" />
+  </a>
+  &nbsp;
+  <a href="https://www.npmjs.com/package/whoburnedmore">
+    <img alt="npm version" src="https://img.shields.io/npm/v/whoburnedmore?style=flat-square&color=cb3837&logo=npm&logoColor=white" />
+  </a>
+  &nbsp;
+  <a href="https://www.npmjs.com/package/whoburnedmore">
+    <img alt="npm downloads" src="https://img.shields.io/npm/dm/whoburnedmore?style=flat-square&color=cb3837&logo=npm&logoColor=white&label=downloads%2Fmo" />
+  </a>
+  &nbsp;
+  <a href="https://github.com/amiinwani/whoburnedmore.com/blob/main/LICENSE">
+    <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" />
+  </a>
+</p>
 
-`whoburnedmore` is the ultimate developer tool for tracking, analyzing, and sharing token usage across AI coding assistants. It reads your local coding-agent telemetry, computes accurate token and cost statistics, and helps you publish daily aggregate numbers to a unified leaderboard.
+<!-- Row 2: environment -->
+<p align="center">
+  <a href="https://nodejs.org">
+    <img alt="Node ≥20" src="https://img.shields.io/badge/node-%E2%89%A520-339933?style=flat-square&logo=node.js&logoColor=white" />
+  </a>
+  &nbsp;
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square&logo=typescript&logoColor=white" />
+  &nbsp;
+  <img alt="zero runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-success?style=flat-square" />
+  &nbsp;
+  <img alt="macOS" src="https://img.shields.io/badge/macOS-✓-000000?style=flat-square&logo=apple&logoColor=white" />
+  &nbsp;
+  <img alt="Linux" src="https://img.shields.io/badge/Linux-✓-FCC624?style=flat-square&logo=linux&logoColor=black" />
+  &nbsp;
+  <img alt="Windows" src="https://img.shields.io/badge/Windows-✓-0078D4?style=flat-square&logo=windows&logoColor=white" />
+</p>
 
-🚀 **This is the real, production CLI** — the exact code published to npm and run on thousands of developers' machines. This repository is a public, always-in-sync open-source mirror of the tool.
+<!-- Row 3: project vibe -->
+<p align="center">
+  <a href="https://whoburnedmore.com">
+    <img alt="Leaderboard" src="https://img.shields.io/badge/🔥_leaderboard-whoburnedmore.com-ff8a3d?style=flat-square" />
+  </a>
+  &nbsp;
+  <img alt="privacy: local-first" src="https://img.shields.io/badge/privacy-local--first-brightgreen?style=flat-square&logo=shield&logoColor=white" />
+  &nbsp;
+  <img alt="zero telemetry" src="https://img.shields.io/badge/telemetry-zero-brightgreen?style=flat-square" />
+  &nbsp;
+  <a href="https://x.com/whoburnedmore">
+    <img alt="X / Twitter" src="https://img.shields.io/badge/@whoburnedmore-000000?style=flat-square&logo=x&logoColor=white" />
+  </a>
+</p>
 
----
-
-## ⚡ Key Features
-
-- 📊 **Multi-Agent Tracking**: Aggregates token statistics across Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, and more.
-- 🔒 **Privacy-First**: No prompts, code snippets, file contents, file paths, or repository names ever leave your machine. Only aggregate numbers (totals) are synchronized.
-- 🖥️ **Offline Local Dashboard**: Run with `--local` to build a beautiful, fully interactive HTML dashboard on your machine without making any network requests.
-- 🕒 **Automatic Background Sync**: Heals, configures, and maintains a lightweight background sync loop (15-min interval) using native operating system schedulers (`launchd`, `systemd`, `cron`, `schtasks`).
-- 💵 **Cost Estimation**: Estimates USD cost for unrecognized models locally using a tiny, accurate, and up-to-date pricing table.
-
----
-
-## 📐 Architectural Overview
-
-`whoburnedmore` functions as a robust, lightweight client-side collection pipeline. It utilizes parallel execution workers to keep collection fast and transparent.
-
-```
-┌────────────────────────────────────────────────────────┐
-│                      LOCAL MACHINE                     │
-│                                                        │
-│  ┌───────────────────┐    ┌─────────────────────────┐  │
-│  │   Coding Agents   │    │  Claude Code / Codex    │  │
-│  │  (Claude, Gemini) │    │       Transcripts       │  │
-│  └─────────┬─────────┘    └────────────┬────────────┘  │
-│            │ (via ccusage)             │               │
-│            ▼                           ▼               │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │               whoburnedmore CLI                  │  │
-│  │  ┌────────────────────────────────────────────┐  │  │
-│  │  │ 1. Collect & Map Daily Usage Data          │  │  │
-│  │  │ 2. Deduplicate and Cap Payload Rows        │  │  │
-│  │  │ 3. Compute Estimated Costs (Pricing Table) │  │  │
-│  │  └──────────────────────┬─────────────────────┘  │  │
-│  └─────────────────────────┼────────────────────────┘  │
-│                            │                           │
-│              (Secure HTTPS │ --local Mode (Offline)    │
-│              Anonymous     ├───► Local HTML Dashboard  │
-│              Submission)   │     (Opened in Browser)   │
-│                            ▼                           │
-└────────────────────────────┼───────────────────────────┘
-                             │
-                             ▼
-              ┌─────────────────────────────┐
-              │   Leaderboard API           │
-              │   (Specified via Env/Config)│
-              └─────────────────────────────┘
-```
-
-The system is composed of several core blocks working in synergy:
-
-### 1. Data Collection & Extraction Flow
-
-The collection pipeline (`src/collect.ts`) executes all tasks concurrently to minimize wall-clock latency:
-
-- **`ccusage` Broker**: Dispatches concurrent subprocesses utilizing the bundled `ccusage` binary to read usage databases for supported agents (`claude`, `codex`, `gemini`, `copilot`, `opencode`, `amp`, `droid`, `goose`, `kimi`, `qwen`, `kilo`, `openclaw`, `hermes`, `pi`, `codebuff`).
-- **Transcript Analyzer (`src/attribution.ts`)**: Scans local transcript log directories (such as `~/.claude/projects` and `~/.codex/sessions`) using an incremental, yield-based scanner that respects a 12-second time budget. It extracts tool-call counts, errors, and subagent invocation telemetry without looking at prompts, code, project/repo names, or conversation titles.
-- **Cursor API Integrator (`src/cursor.ts`)**: Locates the local global storage SQLite database (`state.vscdb`) on the machine, extracts the WorkOS session token, constructs a secure cookie, and performs paginated HTTP requests to Cursor's server to collect personal usage events.
-
-### 2. Aggregation & Verification
-
-- **Deduplication**: Merges multiple logs covering matching daily windows, models, and tools to prevent database unique-key collisions when bulk-writing.
-- **Cost Estimation (`src/pricing.ts`)**: For untracked costs in local transcripts, it maps known models (e.g., Anthropic Claude Sonnet/Opus, OpenAI GPT-4o, Google Gemini Flash) against a lightweight, hardcoded local pricing lookup table to calculate representative expenditures.
-- **Payload Capping**: Limits submitted daily records (max 20,000) and session records (max 10,000) to ensure strict adherence to API rate/size boundaries, preventing larger accounts from failing validation checks.
-
-### 3. Background Synchronization (`src/autosync.ts`)
-
-Once initialized via the CLI, the scheduler configures a 15-minute sync interval. It dynamically inspects the host platform and installs a persistent background job using native schedulers:
-
-- **macOS**: Configures a launchd plist (`com.whoburnedmore.sync.plist`) at `~/Library/LaunchAgents`.
-- **Linux**: Prefers a systemd user timer (`whoburnedmore-sync.timer` & `whoburnedmore-sync.service` in `~/.config/systemd/user`) or fallback system-level cron.
-- **Windows**: Registers a Scheduled Task under the Windows Task Scheduler (`schtasks`).
-- **Foreground Daemon (`src/daemon.ts`)**: For ephemeral environments (e.g., containers, minimal VMs), users can run `whoburnedmore daemon` to keep syncing in the foreground.
-
----
-
-## 📦 Installation & Usage
-
-Run immediately using `npx` (fully zero-install and lightweight):
+<br/>
 
 ```bash
 npx whoburnedmore
 ```
 
-Or install it globally to always have it at your fingertips:
+<sub>No install. No sign-up. Zero dependencies. Reads your local logs — sends only daily totals.</sub>
 
-```bash
-npm install -g whoburnedmore
-whoburnedmore
+</div>
+
+---
+
+## What is this?
+
+`whoburnedmore` is a **local-first CLI** that reads your AI coding-agent usage logs — Claude Code, Codex, Gemini CLI, Copilot, Cursor, and more — counts every token, prices it against a transparent table, and posts **only your daily totals** to a public leaderboard at [whoburnedmore.com](https://whoburnedmore.com).
+
+Your prompts, code, file paths, and project names **never leave your machine**. This isn't a promise in a privacy policy — the [zero-network test](#-trust-but-verify) enforces it on every CI run.
+
+> **Prefer 100% offline?** Run `npx whoburnedmore --local` to build a self-contained HTML dashboard on your machine and upload nothing, ever.
+
+---
+
+## The output
+
+```
+🔥 whoburnedmore — your local AI token burn report
+────────────────────────────────────────────────────────
+
+  1.82B tokens burned   $3,410.00 est.
+  12,704 assistant messages · 18 active days · 2026-05-29 → 2026-06-15
+
+  By model
+    ████████░░░░░░░░░░  claude-opus-4-8       1.10B     $2,512.40
+    █████░░░░░░░░░░░░░  claude-sonnet-4-6     512.0M      $640.10
+    ██░░░░░░░░░░░░░░░░  claude-haiku-4-5      210.0M       $36.20
+
+  By project
+    ███████░░░░░░░░░░░  api                   903.0M    $1,640.00
+    ████░░░░░░░░░░░░░░  web-app               540.0M      $980.00
+    ██░░░░░░░░░░░░░░░░  infra                 377.0M      $790.00
+
+  Prompt cache   97.4% read-hit rate  (1.71B cached reads)
+
+────────────────────────────────────────────────────────
+  100% local · nothing left your machine.
+  Compare on the public board → https://whoburnedmore.com
 ```
 
 ---
 
-## 🛠️ Commands
+## Supported agents
 
-| Command                        | Description                                                                                             |
-| :----------------------------- | :------------------------------------------------------------------------------------------------------ |
-| `whoburnedmore`                | Sync current token usage, land on the leaderboard, and open your web dashboard.                         |
-| `whoburnedmore --local`        | Generate an offline dashboard (HTML file) on your local machine and open it. No network calls are made. |
-| `whoburnedmore --dry-run`      | Output the exact JSON payload that would be sent to the server, then terminate.                         |
-| `whoburnedmore --no-submit`    | Collect token statistics locally and refresh the scheduler without uploading any data.                  |
-| `whoburnedmore private`        | Make your leaderboard profile private.                                                                  |
-| `whoburnedmore public`         | Restore public visibility of your leaderboard profile.                                                  |
-| `whoburnedmore remove`         | Completely delete your dashboard and all its aggregated data from the server.                           |
-| `whoburnedmore status`         | Display background sync status, check job health, and report freshness metrics.                         |
-| `whoburnedmore install-sync`   | Explicitly turn on/install the 15-minute background sync job on your OS.                                |
-| `whoburnedmore uninstall-sync` | Turn off and permanently uninstall the background sync scheduler.                                       |
+<div align="center">
 
----
+| Agent                                                                                                        | Source                                 |
+| ------------------------------------------------------------------------------------------------------------ | -------------------------------------- |
+| ![Claude Code](https://img.shields.io/badge/Claude%20Code-✓-cc785c?style=flat-square)                        | `~/.claude/projects` JSONL transcripts |
+| ![Codex](https://img.shields.io/badge/OpenAI%20Codex-✓-412991?style=flat-square)                             | `~/.codex/sessions` JSONL transcripts  |
+| ![Gemini CLI](https://img.shields.io/badge/Gemini%20CLI-✓-4285F4?style=flat-square)                          | via `ccusage`                          |
+| ![Cursor](https://img.shields.io/badge/Cursor-✓-000000?style=flat-square)                                    | `state.vscdb` → Cursor dashboard API   |
+| ![GitHub Copilot](https://img.shields.io/badge/Copilot-✓-24292e?style=flat-square)                           | via `ccusage`                          |
+| ![OpenCode](https://img.shields.io/badge/OpenCode-✓-0ea5e9?style=flat-square)                                | via `ccusage`                          |
+| ![Amp](https://img.shields.io/badge/Amp%20%7C%20Droid%20%7C%20Goose%20%7C%20more-✓-6b7280?style=flat-square) | via `ccusage` (15+ sources)            |
 
-## ⚙️ Advanced Configuration
-
-Custom environment variables are automatically loaded from a `.env` file in your current directory or from the user configuration folder:
-
-| Environment Variable        | Description                                                                                                                         |
-| :-------------------------- | :---------------------------------------------------------------------------------------------------------------------------------- |
-| `WHOBURNEDMORE_API`         | The base URL of the leaderboard API.                                                                                                |
-| `WHOBURNEDMORE_WEB`         | The base URL of the front-end web dashboard.                                                                                        |
-| `WHOBURNEDMORE_ROOT_DOMAIN` | The root tenant domain of the application.                                                                                          |
-| `WHOBURNEDMORE_CONFIG_DIR`  | Folder path where identity credentials (`config.json`), offline assets, and logs are persisted. Default: `~/.config/whoburnedmore`. |
-| `CLAUDE_CONFIG_DIR`         | Custom location to scan for Claude Code transcripts.                                                                                |
+</div>
 
 ---
 
-## 🛡️ Privacy & Security Hardening
-
-This client was engineered from the ground up to guarantee absolute transparency and security:
-
-- **Domain Restriction**: Prevents malicious link redirects. Auto-opened dashboard links are parsed and verified to ensure they only match your trusted `WHOBURNEDMORE_WEB` configuration.
-- **Strict Shell Sanitization**: Background scheduler arguments (POSIX cron, macOS plist, Windows Task parameters) are comprehensively quoted, escaped, and normalized to prevent arbitrary shell injection.
-- **Restricted File Privileges**: Local state configurations containing the secure identity keys are saved at a strict POSIX mode `0600` (readable/writable only by the owner) using transactional temp-write and atomic-rename operations.
-- **Zero Telemetry**: No third-party tracking, crash reporting, or analytical payloads. You are completely in control of your data.
-
----
-
-## 💻 Development & Contribution
-
-We welcome contributions from the community! To set up `whoburnedmore` locally and start hacking:
-
-### 1. Prerequisites
-
-Ensure you have **Node.js 20+** and **npm** installed on your platform.
-
-### 2. Setup
+## Commands
 
 ```bash
-# Clone the repository
+npx whoburnedmore                # submit + land on the leaderboard, open your dashboard
+npx whoburnedmore --local        # build the dashboard locally, upload nothing
+npx whoburnedmore --dry-run      # print exactly what would be sent, send nothing
+npx whoburnedmore --no-submit    # collect locally, send nothing
+
+npx whoburnedmore private        # hide your dashboard from the leaderboard
+npx whoburnedmore public         # put it back
+npx whoburnedmore remove         # delete your dashboard and all its data
+
+npx whoburnedmore status         # check background-sync health
+npx whoburnedmore install-sync   # turn on 15-minute background sync
+npx whoburnedmore uninstall-sync # turn off the background sync
+```
+
+After your first run a background sync keeps your leaderboard page fresh every 15 minutes (`uninstall-sync` to stop). The installed job always runs the latest published package, so future fixes are picked up automatically.
+
+---
+
+## How it works
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                          LOCAL MACHINE                           │
+│                                                                  │
+│   ┌──────────────────────┐    ┌────────────────────────────┐     │
+│   │    Coding Agents     │    │  Claude Code / Codex JSONL │     │
+│   │  Claude · Gemini     │    │       ~/.claude/projects   │     │
+│   │  Cursor · Copilot…   │    │       ~/.codex/sessions    │     │
+│   └──────────┬───────────┘    └─────────────┬──────────────┘     │
+│              │  (via ccusage)               │  (streaming scan)  │
+│              ▼                              ▼                    │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │                   whoburnedmore CLI                      │   │
+│   │                                                          │   │
+│   │   1. Collect & map daily usage data  (concurrent)        │   │
+│   │   2. Deduplicate overlapping windows                     │   │
+│   │   3. Estimate costs via local pricing table              │   │
+│   │   4. Cap payload (20k daily rows / 10k session rows)     │   │
+│   │                                                          │   │
+│   └───────────────────────────┬──────────────────────────────┘   │
+│                               │                                  │
+│         --local (offline) ◄───┤───► HTTPS anonymous POST        │
+│         Local HTML dashboard  │                                  │
+└───────────────────────────────┼──────────────────────────────────┘
+                                ▼
+                ┌───────────────────────────────┐
+                │      api.whoburnedmore.com    │
+                │     Public Leaderboard API    │
+                └───────────────────────────────┘
+```
+
+**Collection** (`src/collect.ts`) runs everything concurrently: a `ccusage` broker for 15+ agents, a streaming JSONL transcript analyzer (`src/attribution.ts`) with a 12-second hard deadline, and a Cursor SQLite integrator (`src/cursor.ts`) that calls Cursor's dashboard API for usage not stored locally.
+
+**Identity** — on first run the CLI generates a cryptographically secure 32-byte hex `anonKey` written to `~/.config/whoburnedmore/config.json` with `0600` permissions via atomic temp-rename. This is your only identity. No sign-up required.
+
+**Background sync** runs on native schedulers:
+
+| Platform       | Mechanism                                                              |
+| -------------- | ---------------------------------------------------------------------- |
+| macOS          | `launchd` plist · `~/Library/LaunchAgents` · `ProcessType: Background` |
+| Linux          | `systemd` user timer, or cron fallback                                 |
+| Windows        | `schtasks` scheduled task                                              |
+| Container / VM | `whoburnedmore daemon` (foreground)                                    |
+
+---
+
+## What leaves your machine
+
+<div align="center">
+
+| ✅ Sent                               | ❌ Never sent                |
+| ------------------------------------- | ---------------------------- |
+| Date                                  | Prompts or responses         |
+| Tool name & model                     | Source code or file contents |
+| Token counts (input / output / cache) | File paths or project names  |
+| Estimated USD cost                    | Workspace or repo names      |
+| Session count (optional)              | Conversation titles          |
+
+</div>
+
+---
+
+## 🔒 Trust but verify
+
+The `--local` flag disables all network calls. But talk is cheap — a committed [`test/zero-network.test.ts`](./test/zero-network.test.ts) **greps both the TypeScript source and the compiled `dist/` bundle** for `fetch`, raw sockets (`node:net` / `tls` / `dgram`), `WebSocket`, and any `http(s)://` literal on every CI push. A regression that phones home fails the build.
+
+```
+✓ source: no fetch / http / socket calls found
+✓ bundle: no fetch / http / socket calls found
+```
+
+---
+
+## Configuration
+
+| Variable                   | Description                            |
+| -------------------------- | -------------------------------------- |
+| `WHOBURNEDMORE_API`        | Override the leaderboard API endpoint  |
+| `WHOBURNEDMORE_WEB`        | Override the web dashboard origin      |
+| `WHOBURNEDMORE_CONFIG_DIR` | Config, credentials, and log directory |
+| `CLAUDE_CONFIG_DIR`        | Root path for Claude Code transcripts  |
+
+---
+
+## Development
+
+```bash
+# Prerequisites: Node.js 20+
+
 git clone https://github.com/amiinwani/whoburnedmore.com.git
 cd whoburnedmore.com
 
-# Install dependencies and perform initial build
-npm install
+npm install       # install deps + build
+npm test          # Vitest suite (includes zero-network check)
+npm run lint      # TypeScript strict check
+npm run build     # compile → dist/cli.js (single bundle, zero runtime deps)
+npm start         # == node dist/cli.js
 ```
 
-### 3. Verification & Testing
-
-Before opening a Pull Request, run the verification commands to check type safety and suite integrity:
+Or run straight from GitHub without cloning:
 
 ```bash
-# Run the test suite (Vitest)
-npm test
-
-# Check code typing
-npm run lint
-
-# Compile and bundle the source
-npm run build
+npx github:amiinwani/whoburnedmore.com
 ```
-
-Please review [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution guidelines and codebase styles.
 
 ---
 
-## 📄 License
+## Contributing
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
+Contributions are welcome. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a PR. Bug reports and feature requests go in [Issues](https://github.com/amiinwani/whoburnedmore.com/issues).
 
-    http://www.apache.org/licenses/LICENSE-2.0
+---
 
-Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+## License
+
+Licensed under the **Apache License 2.0**. See [LICENSE](./LICENSE) for the full text.
+
+---
+
+<div align="center">
+  <sub>
+    Built by <a href="https://x.com/whoburnedmore">@whoburnedmore</a>
+    &nbsp;·&nbsp;
+    <a href="https://whoburnedmore.com/privacy">Privacy</a>
+    &nbsp;·&nbsp;
+    <a href="https://whoburnedmore.com">whoburnedmore.com</a>
+  </sub>
+</div>
