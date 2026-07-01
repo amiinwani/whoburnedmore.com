@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { platform } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import pc from "picocolors";
-import type { SubmitPayload } from "./shared.js";
+import type { SubmitPayload, VerifyRequestRecord } from "./shared.js";
 import {
   applyScope,
   parseBoard,
@@ -19,12 +20,17 @@ import {
   anonSubmit,
   anonRemove,
   anonVisibility,
+  deviceStart,
+  devicePoll,
   resolveOpenTarget,
+  submit as submitSignedInUsage,
   apiBase,
   webBase,
   isTrustedWebUrl,
   isOpenableUrl,
   redeemServerInstall,
+  verifyUsage,
+  UnauthorizedError,
 } from "./api.js";
 import {
   autoSyncInstalled,
@@ -39,16 +45,23 @@ import {
 import { printBanner } from "./banner.js";
 import { daemonLoop } from "./daemon.js";
 import { collectAll, type ProgressFn } from "./collect.js";
+import { collectClaudeRequests } from "./native/claude.js";
 import {
+  clearAuth,
   defaultConfigDir,
   ensureAnonKey,
   loadConfig,
   recordLaunchNotificationDelivered,
   recordSync,
+  saveAuth,
 } from "./config.js";
 import { agentStatusReport } from "./status.js";
 import { renderDashboardHtml } from "./local-dashboard.js";
-import { sanitizeServerText, submitNextStepLines } from "./output.js";
+import {
+  sanitizeServerText,
+  signedInNextStepLines,
+  submitNextStepLines,
+} from "./output.js";
 import { publishLocal } from "./publish.js";
 
 const require = createRequire(import.meta.url);
@@ -267,13 +280,196 @@ async function run(flags: Flags): Promise<void> {
     return;
   }
 
-  // Always submit anonymously: the CLI never signs in (the web is the source of
-  // truth for accounts). This machine's key owns a public, shareable dashboard;
-  // sign in on the web to claim it — that binds this key to your account so
-  // future runs keep landing there.
-  const anonKey = ensureAnonKey();
+  // Submission requires a SIGNED-IN account. The CLI authenticates with a
+  // server-issued token from the device sign-in flow, so a fabricated POST can
+  // no longer land usage on someone's account. Resolution order:
+  //   1. a stored CLI token  → authenticated /v1/submit
+  //   2. a legacy/linked device key (server-install or pre-sign-in install)
+  //      → keep the device-key path so existing & headless installs don't break
+  //   3. fresh machine, a person at the keyboard → sign in first, then submit
+  //   4. fresh machine, unattended → stay silent (never prompt, never mint anon)
+  const cfg = loadConfig();
+  // Sign-in is only attempted in a foreground run on a real terminal. The device
+  // flow doesn't read stdin (approval happens in the browser), but we still gate
+  // on a TTY so a non-interactive foreground run (CI/piped) doesn't hang polling
+  // for the code's full lifetime. quiet ⇒ background (sync/daemon/link).
+  const canSignIn = !flags.quiet && Boolean(process.stdout.isTTY);
+
+  if (cfg?.cliToken) {
+    await submitSignedIn(cfg.cliToken, payload, flags, canSignIn);
+  } else if (cfg?.anonKey) {
+    await submitWithDeviceKey(cfg.anonKey, payload, flags);
+  } else if (canSignIn) {
+    const auth = await ensureSignedIn();
+    if (!auth) return; // sign-in aborted/timed out — nothing submitted
+    await submitSignedIn(auth.token, payload, flags, canSignIn);
+  } else if (!flags.quiet) {
+    // Foreground but no usable terminal (CI/piped) and no stored credential — we
+    // can't run the browser sign-in here. Point the way instead of hanging or
+    // silently doing nothing; never mint an anonymous dashboard behind the user.
+    console.log(pc.yellow("  Sign in to put your usage on the leaderboard."));
+    console.log(
+      pc.dim(
+        "  Run `npx whoburnedmore` in an interactive terminal to sign in, or `npx whoburnedmore link --token=…` (from your signed-in profile) for servers/CI.",
+      ),
+    );
+  } else {
+    // Background with no credential: stay completely silent — never prompt.
+    return;
+  }
+}
+
+/** Sleep for `ms`. Used to pace device-token polling. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Interactive device sign-in. Returns a stored token immediately if present;
+ * otherwise starts the device flow — prints the user code, opens the web verify
+ * page, and polls until the signed-in user approves it — then persists and
+ * returns the token. Returns null if it times out or the user never approves.
+ * Only call this with a TTY; background runs must never reach it.
+ */
+async function ensureSignedIn(): Promise<{ token: string; handle: string } | null> {
+  const cfg = loadConfig();
+  if (cfg?.cliToken) return { token: cfg.cliToken, handle: cfg.handle ?? "" };
+
+  let dev;
+  try {
+    dev = await deviceStart();
+  } catch (err) {
+    console.log(pc.yellow(`  Couldn't start sign-in: ${(err as Error).message}`));
+    return null;
+  }
+
+  console.log();
+  console.log(pc.bold("  Sign in to whoburnedmore to put your usage on the board."));
+  console.log(`  1. Opening ${pc.cyan(sanitizeServerText(dev.verifyUrl))} — or go there yourself.`);
+  console.log(`  2. Approve this code: ${pc.bold(sanitizeServerText(dev.userCode))}`);
+  // Only auto-open a verify URL that's genuinely on our own web host (guards a
+  // hostile/MITM'd API response); otherwise the printed URL above is the fallback.
+  if (isTrustedWebUrl(dev.verifyUrl)) openBrowser(dev.verifyUrl);
+  console.log(pc.dim("  Waiting for you to approve in the browser…"));
+
+  const deadline = Date.now() + dev.expiresInSeconds * 1000;
+  const intervalMs = Math.max(1, dev.pollIntervalSeconds) * 1000;
+  while (Date.now() < deadline) {
+    await sleep(intervalMs);
+    let res;
+    try {
+      res = await devicePoll(dev.deviceCode);
+    } catch {
+      continue; // transient network blip — keep polling until the deadline
+    }
+    if (res.status === "ok") {
+      saveAuth(undefined, { cliToken: res.token, handle: res.handle });
+      console.log(pc.green(`  ✓ Signed in as @${sanitizeServerText(res.handle)}.`));
+      return { token: res.token, handle: res.handle };
+    }
+    if (res.status === "expired") break;
+  }
+  console.log(
+    pc.yellow("  Sign-in timed out. Run `npx whoburnedmore` again to retry."),
+  );
+  return null;
+}
+
+/**
+ * Submit as a signed-in user via the authenticated /v1/submit path. On a 401 the
+ * stored token is expired/invalid: drop it and, if interactive, re-sign-in once
+ * and retry; unattended, give up quietly (the next interactive run re-auths).
+ */
+async function submitSignedIn(
+  token: string,
+  payload: SubmitPayload,
+  flags: Flags,
+  interactive: boolean,
+): Promise<void> {
+  let result;
+  try {
+    result = await submitSignedInUsage(token, payload);
+  } catch (err) {
+    if (err instanceof UnauthorizedError) {
+      clearAuth();
+      if (!interactive) return; // background can't re-auth — stay silent
+      const auth = await ensureSignedIn();
+      if (!auth) return;
+      result = await submitSignedInUsage(auth.token, payload);
+    } else {
+      throw err;
+    }
+  }
+
+  try {
+    recordSync();
+  } catch {
+    /* best-effort — never fail a submit over a freshness stamp */
+  }
+
+  // Signed-in users are already on the board, so there's no claim handoff —
+  // open the org board, friends board, or their profile directly.
+  const baseUrl = result.orgBoardUrl ?? result.boardUrl ?? result.profileUrl;
+  if (!flags.quiet) {
+    console.log(
+      pc.green("  ✓ Synced securely.") +
+        pc.dim(" Only your daily totals left this machine — never your prompts, code, or file names."),
+    );
+    // Delisted? Surface it right here and offer the one-step fix in the same
+    // session — the user is already signed in and at the keyboard, so this turns
+    // "discover you're gone → hunt for the fix → open a terminal" into one prompt.
+    if (result.suppressed) {
+      console.log();
+      console.log(
+        pc.yellow(
+          "  ⚠ You're currently OFF the leaderboard — we couldn't verify these numbers.",
+        ),
+      );
+      console.log(
+        pc.dim(
+          "  Verify your usage to get back on — this sends a detailed per-request breakdown (timestamps + token counts, never your prompts or code).",
+        ),
+      );
+      if (process.stdin.isTTY && (await confirm("  Verify now?"))) {
+        await runVerify();
+        afterSubmitChores(flags);
+        return;
+      }
+      console.log(
+        pc.dim(
+          "  Run `npx whoburnedmore verify` anytime, or appeal at whoburnedmore.com/appeal.",
+        ),
+      );
+    }
+    if (isTrustedWebUrl(baseUrl)) {
+      console.log(pc.dim("  Opening your dashboard in your browser…"));
+      openBrowser(baseUrl);
+    } else {
+      console.log(
+        pc.dim("  The server returned an unexpected dashboard address, so it was NOT auto-opened. Open it yourself only if you trust it:"),
+      );
+      console.log(`  ${sanitizeServerText(baseUrl)}`);
+    }
+    for (const line of signedInNextStepLines(result)) {
+      if (line.includes("→")) console.log(pc.bold(line));
+      else console.log(line);
+    }
+  }
+  afterSubmitChores(flags);
+}
+
+/**
+ * Legacy / headless path: submit with a device key already bound to an account
+ * server-side (a `link`-ed server, or an install from before sign-in existed).
+ * Mirrors the previous anonymous flow, including the claim handoff in the opened
+ * URL so a not-yet-claimed device key can still be claimed on the web.
+ */
+async function submitWithDeviceKey(
+  anonKey: string,
+  payload: SubmitPayload,
+  flags: Flags,
+): Promise<void> {
   const result = await anonSubmit(anonKey, payload);
-  // Record a successful sync so `status` can report freshness (truer than log mtime).
   try {
     recordSync();
   } catch {
@@ -289,23 +485,9 @@ async function run(flags: Flags): Promise<void> {
   } catch {
     /* best-effort — never fail a submit over a launch notification */
   }
-  // Take the user straight to their live page in the browser, first thing —
-  // the board if they joined one, otherwise their claimable dashboard. Either
-  // way we carry the claim handoff (key + slug) in the URL fragment so signing
-  // in on that page claims this machine's submission instead of stranding it as
-  // an anonymous row.
-  // Land the runner on the ORG board when they joined one (the brief: running the
-  // command always ends up on the org leaderboard), else a friends board, else
-  // their own dashboard — see resolveOpenTarget.
   const { baseUrl, target } = resolveOpenTarget(result, anonKey);
-  // The dashboard/board URL comes BACK from the server. Only auto-open it if it's a real
-  // https URL on our own web host — a malicious or MITM'd response must never make us
-  // launch an arbitrary URL/scheme/handler. Otherwise show it as text; never auto-open.
   const trusted = isTrustedWebUrl(baseUrl);
   if (!flags.quiet) {
-    // No burn report in the terminal. Reassure on security, then hand the user
-    // straight to the browser where the dashboard summarises everything — and
-    // tell them the one next step (sign in + add X) that gets them on the board.
     console.log(
       pc.green("  ✓ Synced securely.") +
         pc.dim(" Only your daily totals left this machine — never your prompts, code, or file names."),
@@ -319,40 +501,33 @@ async function run(flags: Flags): Promise<void> {
       );
       console.log(`  ${sanitizeServerText(baseUrl)}`);
     }
-  }
-  // Destination + the single next step (sign in + add X). No usage numbers —
-  // the dashboard summarises the burn. Built by a pure helper so it stays testable.
-  const lines = submitNextStepLines(result);
-  for (const line of lines) {
-    // Emphasise the call-to-action arrow line; dim the management hint.
-    if (line.includes("→")) console.log(pc.bold(line));
-    else if (line.startsWith("  Private until you do")) {
-      if (!flags.quiet) console.log(pc.dim(line));
-    } else console.log(line);
-  }
-
-  // Keep the dashboard live by default: heal-on-run. On a normal run, reconcile the
-  // background sync — install it if absent, AND reinstall it if the installed agent
-  // has drifted from what the current CLI expects (stale interval, dead node path,
-  // changed script path). This is what makes a config change actually re-apply to
-  // an already-installed machine instead of silently sticking with the old plist.
-  // Best-effort — a scheduler hiccup or unsupported OS must never fail a submit.
-  if (!flags.quiet) {
-    try {
-      reconcileAutoSync();
-    } catch {
-      // ignore — the submit already succeeded; user can `install-sync` manually.
+    for (const line of submitNextStepLines(result)) {
+      if (line.includes("→")) console.log(pc.bold(line));
+      else if (line.startsWith("  Private until you do")) console.log(pc.dim(line));
+      else console.log(line);
     }
   }
+  afterSubmitChores(flags);
+}
 
-  if (!flags.quiet) {
-    console.log();
-    console.log(
-      autoSyncInstalled()
-        ? pc.dim("  Background sync is on — your page updates automatically every 15 min (`npx whoburnedmore uninstall-sync` to stop).")
-        : pc.dim("  Re-run anytime to update your page."),
-    );
+/**
+ * Post-submit housekeeping shared by both submit paths: heal-on-run reconcile of
+ * the background sync (install if absent, repair if drifted) and the one-line
+ * background-sync status footer. Best-effort — never fails an already-good submit.
+ */
+function afterSubmitChores(flags: Flags): void {
+  if (flags.quiet) return;
+  try {
+    reconcileAutoSync();
+  } catch {
+    // ignore — the submit already succeeded; user can `install-sync` manually.
   }
+  console.log();
+  console.log(
+    autoSyncInstalled()
+      ? pc.dim("  Background sync is on — your page updates automatically every 15 min (`npx whoburnedmore uninstall-sync` to stop).")
+      : pc.dim("  Re-run anytime to update your page."),
+  );
 }
 
 async function linkServerInstall(token: string | undefined): Promise<void> {
@@ -458,6 +633,119 @@ async function runDaemon(): Promise<void> {
   console.log(pc.dim(`  Daemon stopped after ${cycles} sync cycle${cycles === 1 ? "" : "s"}.`));
 }
 
+/**
+ * Re-verify a delisted account (`whoburnedmore verify`). Reads the local
+ * per-request skeleton (timestamps + token counts, NEVER content), uploads it to
+ * the authenticated /v1/verify endpoint, and reports the verdict — relisted, kept
+ * off pending a human, or rejected. Requires sign-in (it's tied to the account
+ * that was delisted).
+ */
+async function runVerify(): Promise<void> {
+  printBanner();
+  console.log();
+  console.log(pc.bold("  Verify your usage to get back on the leaderboard."));
+  console.log(
+    pc.dim(
+      "  This sends a DETAILED per-request breakdown — timestamps and token counts, still never your prompts, code, or file names — so we can confirm your usage is real. It's deleted after review.",
+    ),
+  );
+
+  // Verify is tied to the delisted account, so it requires sign-in.
+  const cfg = loadConfig();
+  let token = cfg?.cliToken;
+  if (!token) {
+    if (!process.stdout.isTTY) {
+      console.log(
+        pc.yellow(
+          "  Sign in first — run `npx whoburnedmore verify` in an interactive terminal.",
+        ),
+      );
+      return;
+    }
+    const auth = await ensureSignedIn();
+    if (!auth) return;
+    token = auth.token;
+  }
+
+  if (process.stdin.isTTY) {
+    const ok = await confirm("\n  Send this breakdown to verify your usage?");
+    if (!ok) {
+      console.log(pc.dim("  Cancelled — nothing was sent."));
+      return;
+    }
+  }
+
+  console.log(pc.dim("  Reading your local Claude Code logs…"));
+  const { requests, found } = await collectClaudeRequests();
+  if (!found || requests.length === 0) {
+    console.log(
+      pc.yellow("  No local Claude Code logs found on this machine to verify."),
+    );
+    console.log(
+      pc.dim(
+        "  Run this on the machine where you actually use Claude Code, or file a written appeal at whoburnedmore.com/appeal.",
+      ),
+    );
+    return;
+  }
+
+  // Bound the upload: send the most-recent CAP requests, flag truncation so the
+  // server treats a sampled upload conservatively.
+  const CAP = 50_000;
+  const sorted = requests.slice().sort((a, b) => b.ts - a.ts);
+  const truncated = sorted.length > CAP;
+  const capped = truncated ? sorted.slice(0, CAP) : sorted;
+  const records: VerifyRequestRecord[] = capped.map((r) => ({
+    date: r.date,
+    ts: r.ts,
+    tool: "claude",
+    model: r.model,
+    inputTokens: r.inputTokens,
+    outputTokens: r.outputTokens,
+    cacheCreationTokens: r.cacheCreationTokens,
+    cacheReadTokens: r.cacheReadTokens,
+    reqHash: createHash("sha256").update(r.key).digest("hex").slice(0, 32),
+  }));
+
+  console.log(
+    pc.dim(
+      `  Sending ${records.length} request records for analysis${truncated ? " (most recent, sampled)" : ""}…`,
+    ),
+  );
+  let result;
+  try {
+    result = await verifyUsage(token, {
+      cliVersion: VERSION,
+      requests: records,
+      ...(truncated ? { truncated: true } : {}),
+    });
+  } catch (err) {
+    if (err instanceof UnauthorizedError) {
+      clearAuth();
+      console.log(
+        pc.yellow(
+          "  Your sign-in expired — run `npx whoburnedmore verify` again to retry.",
+        ),
+      );
+      return;
+    }
+    throw err;
+  }
+
+  console.log();
+  const line = `  ${sanitizeServerText(result.message)}`;
+  if (result.relisted) {
+    console.log(pc.green(`  ✓${line.slice(1)}`));
+  } else {
+    console.log(result.verdict === "fail" ? pc.yellow(line) : line);
+    console.log(
+      pc.dim(
+        "  We'll relist you automatically if it checks out — re-run `npx whoburnedmore` anytime to check.",
+      ),
+    );
+  }
+}
+
 async function main(): Promise<void> {
   const major = Number(process.versions.node.split(".")[0]);
   if (major < 20) {
@@ -501,6 +789,9 @@ async function main(): Promise<void> {
       break;
     case "daemon":
       await runDaemon();
+      break;
+    case "verify":
+      await runVerify();
       break;
     case "status":
     case "doctor": {
@@ -556,8 +847,8 @@ function printHelp(): void {
   ${pc.bold("whoburnedmore")} — who burned more tokens, you or them?
 
   ${pc.bold("usage")}
-    npx whoburnedmore              burn + land on the public leaderboard, open your dashboard
-    npx whoburnedmore --board=CODE compare with friends — join their board (no sign-in)
+    npx whoburnedmore              sign in, burn + land on the public leaderboard, open your dashboard
+    npx whoburnedmore --board=CODE compare with friends — sign in and join their board
     npx whoburnedmore --org=SLUG   submit to your organization's board (companies/hackathons)
     npx whoburnedmore --local      build the dashboard on your machine and open it (offline)
     npx whoburnedmore --dry-run    print exactly what would be sent, send nothing
@@ -567,14 +858,15 @@ function printHelp(): void {
     npx whoburnedmore private      hide your dashboard from the leaderboard
     npx whoburnedmore public       put it back on the leaderboard
     npx whoburnedmore remove       delete your dashboard and its data
+    npx whoburnedmore verify       delisted? re-verify your usage to get back on (sends a detailed breakdown)
     npx whoburnedmore status       check background-sync health (last sync, staleness)
     npx whoburnedmore uninstall-sync   turn off the background sync
     npx whoburnedmore install-sync     turn it back on after uninstalling
 
-  Background sync is on by default: after your first run, your page refreshes
-  automatically every 15 min (\`uninstall-sync\` to stop). Your dashboard is public on
-  the leaderboard as an anonymous burner — sign in on whoburnedmore.com to claim
-  it (handle + X) and own your rank, or run \`private\`/\`remove\` to pull it. Only
+  Your first run signs you in (we open a page, you approve a short code) and binds
+  this machine to your account — your usage lands on the leaderboard under your
+  handle. Background sync is on by default: your page then refreshes automatically
+  every 15 min (\`uninstall-sync\` to stop); run \`private\`/\`remove\` to pull it. Only
   daily aggregate numbers (date, tool, model, token counts, est. cost) ever leave
   your machine — never prompts, code, or file names. With --local, nothing leaves
   your machine at all.

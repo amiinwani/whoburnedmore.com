@@ -12,9 +12,17 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export interface CliConfig {
-  /** Secret that owns this machine's dashboard. The CLI's only identity — the
-   *  web is the source of truth for accounts (claim this dashboard there). */
+  /** Secret that owns this machine's LEGACY anonymous dashboard / server-install
+   *  device binding. The new CLI signs in instead (see `cliToken`); this is kept
+   *  only for already-linked headless servers and pre-sign-in installs. */
   anonKey?: string;
+  /** Server-issued CLI bearer token (a `typ:"cli"` JWT) obtained from the device
+   *  sign-in flow. The account credential the authenticated submit path
+   *  (`/v1/submit`) presents — this is what makes a run a SIGNED-IN run, so a
+   *  fabricated POST can no longer land usage on an account. Owner-only on disk. */
+  cliToken?: string;
+  /** The signed-in handle `cliToken` belongs to, for friendly terminal messaging. */
+  handle?: string;
   /** Epoch ms of the last successful submit. Powers `status` freshness/staleness
    *  reporting — a truer signal than the log file's mtime, which moves on any
    *  write (including errors). */
@@ -39,6 +47,8 @@ export function loadConfig(dir: string = defaultConfigDir()): CliConfig | null {
     >;
     const config: CliConfig = {};
     if (typeof parsed.anonKey === "string") config.anonKey = parsed.anonKey;
+    if (typeof parsed.cliToken === "string") config.cliToken = parsed.cliToken;
+    if (typeof parsed.handle === "string") config.handle = parsed.handle;
     if (typeof parsed.lastSyncAt === "number" && Number.isFinite(parsed.lastSyncAt))
       config.lastSyncAt = parsed.lastSyncAt;
     if (
@@ -115,4 +125,28 @@ export function recordLaunchNotificationDelivered(
 ): void {
   const config = loadConfig(dir) ?? {};
   saveConfig(dir, { ...config, launchNotificationDeliveredAt: when });
+}
+
+/**
+ * Persist the signed-in CLI bearer token (and handle), preserving the rest of
+ * the config. Written owner-only via saveConfig's atomic 0600 rename — this is a
+ * real account credential, so it must never land in a world-readable file.
+ */
+export function saveAuth(
+  dir: string = defaultConfigDir(),
+  auth: { cliToken: string; handle?: string } = { cliToken: "" },
+): void {
+  const config = loadConfig(dir) ?? {};
+  saveConfig(dir, { ...config, cliToken: auth.cliToken, handle: auth.handle });
+}
+
+/**
+ * Drop the stored CLI token + handle (e.g. after the server rejects it as
+ * expired/invalid), preserving everything else so the machine can re-sign-in.
+ */
+export function clearAuth(dir: string = defaultConfigDir()): void {
+  const config = loadConfig(dir);
+  if (!config?.cliToken && !config?.handle) return;
+  const { cliToken: _t, handle: _h, ...rest } = config;
+  saveConfig(dir, rest);
 }

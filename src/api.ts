@@ -1,4 +1,12 @@
-import type { AnonSubmitResponse, SubmitPayload } from "./shared.js";
+import type {
+  AnonSubmitResponse,
+  DeviceCodeResponse,
+  DeviceTokenResponse,
+  SubmitPayload,
+  SubmitResponse,
+  VerifyPayload,
+  VerifyResponse,
+} from "./shared.js";
 
 export interface ServerInstallRedeemResponse {
   ok: true;
@@ -76,12 +84,18 @@ async function readJson<T>(res: Response): Promise<T> {
 async function post<T>(
   path: string,
   body: unknown,
+  token?: string,
 ): Promise<{ status: number; body: T }> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  // A signed-in run presents its CLI bearer token so the server attributes the
+  // usage to the account (the authenticated /v1/submit path) instead of trusting
+  // a body-supplied key.
+  if (token) headers.Authorization = `Bearer ${token}`;
   let res: Response;
   try {
     res = await fetch(`${apiBase()}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       // Bound the request so a slow/black-holing/hostile server can't hang the CLI
       // — or the unattended 15-minute background sync — indefinitely.
@@ -93,6 +107,30 @@ async function post<T>(
     );
   }
   return { status: res.status, body: await readJson<T>(res) };
+}
+
+/**
+ * Upload the per-request forensic skeleton for a delisted account
+ * (`whoburnedmore verify`). Authenticated with the CLI bearer token — the server
+ * ties it to the signed-in account, analyzes it, and either relists the user
+ * (pass), keeps them delisted (fail), or routes it to a human (review).
+ */
+export async function verifyUsage(
+  token: string,
+  payload: VerifyPayload,
+): Promise<VerifyResponse> {
+  const { status, body } = await post<
+    VerifyResponse | { error: string; details?: string[] }
+  >("/v1/verify", payload, token);
+  if (status === 401) throw new UnauthorizedError();
+  if (status !== 200) {
+    const err = body as { error: string; details?: string[] };
+    const details = err.details?.length
+      ? `\n  - ${err.details.join("\n  - ")}`
+      : "";
+    throw new Error(`${err.error ?? "verification failed"}${details}`);
+  }
+  return body as VerifyResponse;
 }
 
 /** Submit anonymously: no sign-in, the key owns a public, shareable dashboard. */
@@ -109,6 +147,67 @@ export async function anonSubmit(
     throw new Error(`${err.error ?? `submit failed (HTTP ${status})`}${details}`);
   }
   return body as AnonSubmitResponse;
+}
+
+/** Thrown by `submit` when the server rejects the CLI token (expired/invalid). */
+export class UnauthorizedError extends Error {
+  constructor(message = "your sign-in has expired") {
+    super(message);
+    this.name = "UnauthorizedError";
+  }
+}
+
+/**
+ * Begin the device sign-in flow: ask the server for a one-time user code and the
+ * web URL where the signed-in user approves it. The CLI prints the code, opens
+ * the URL, then polls `devicePoll` until approval.
+ */
+export async function deviceStart(): Promise<DeviceCodeResponse> {
+  const { status, body } = await post<DeviceCodeResponse | { error?: string }>(
+    "/v1/auth/device",
+    {},
+  );
+  if (status !== 200) {
+    throw new Error(
+      (body as { error?: string }).error ?? `sign-in failed (HTTP ${status})`,
+    );
+  }
+  return body as DeviceCodeResponse;
+}
+
+/** Poll the device-token endpoint once; returns pending/expired/ok(+token). */
+export async function devicePoll(
+  deviceCode: string,
+): Promise<DeviceTokenResponse> {
+  const { status, body } = await post<DeviceTokenResponse | { error?: string }>(
+    "/v1/auth/device/token",
+    { deviceCode },
+  );
+  if (status !== 200) {
+    throw new Error(`sign-in failed (HTTP ${status})`);
+  }
+  return body as DeviceTokenResponse;
+}
+
+/**
+ * Submit usage as a SIGNED-IN user: the token authenticates the account, so no
+ * key rides in the body and a fabricated POST can't target someone else. Throws
+ * `UnauthorizedError` on a 401 so the caller can clear the token and re-sign-in.
+ */
+export async function submit(
+  token: string,
+  payload: SubmitPayload,
+): Promise<SubmitResponse> {
+  const { status, body } = await post<
+    SubmitResponse | { error: string; details?: string[] }
+  >("/v1/submit", payload, token);
+  if (status === 401) throw new UnauthorizedError();
+  if (status !== 200) {
+    const err = body as { error: string; details?: string[] };
+    const details = err.details?.length ? `\n  - ${err.details.join("\n  - ")}` : "";
+    throw new Error(`${err.error ?? `submit failed (HTTP ${status})`}${details}`);
+  }
+  return body as SubmitResponse;
 }
 
 /**

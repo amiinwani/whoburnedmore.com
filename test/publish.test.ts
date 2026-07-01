@@ -76,10 +76,12 @@ describe("publishLocal", () => {
   it("strips terminal control bytes from the server dashboard URL before printing", async () => {
     const d = deps(true, "https://whoburnedmore.com/d/\u001b]0;pwned\u0007x");
     await publishLocal(payload, d);
-    // Join with a space, not "\n": a newline is itself a control byte the regex
-    // below would (wrongly) flag — that would mask whether the SERVER text was
-    // sanitized. We only care that no control bytes survive within the printed text.
-    const printed = d.log.mock.calls.map((c) => String(c[0])).join(" ");
+    // Concatenate WITHOUT a separator — joining on "\n" would itself inject a
+    // 0x0a control byte, so the assertion below could never pass regardless of
+    // sanitization. We're asserting the server-supplied URL's control bytes
+    // (the ESC/BEL of its OSC sequence) never reach the terminal, which
+    // sanitizeServerText guarantees.
+    const printed = d.log.mock.calls.map((c) => String(c[0])).join("");
     // eslint-disable-next-line no-control-regex -- asserting control bytes are gone
     expect(printed).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
   });

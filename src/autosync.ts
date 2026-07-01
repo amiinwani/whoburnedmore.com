@@ -50,6 +50,86 @@ const STABLE_NPM_CANDIDATES = [
 const LATEST_PACKAGE_SPEC = "whoburnedmore@latest";
 
 /**
+ * Standard executable directories to fold into the background-sync PATH. OS
+ * schedulers (launchd, cron, systemd) run jobs with a stripped-down environment
+ * — launchd's is just `/usr/bin:/bin:/usr/sbin:/sbin`, which excludes both
+ * Homebrew dirs. Our plist invokes `npm`, and npm's shebang is
+ * `#!/usr/bin/env node`; `npm exec` then spawns the package bin, whose shebang
+ * is *also* `#!/usr/bin/env node`. With node off PATH every tick dies with
+ * `env: node: No such file or directory` (exit 127) and the account stops
+ * syncing silently. Including the Homebrew + /usr/local dirs (where node lives
+ * on the vast majority of machines) makes `env node` resolve.
+ */
+const SYNC_PATH_DIRS = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+];
+
+/**
+ * The PATH to export into the scheduler environment so the npm we invoke (and
+ * the node its shebang needs) resolve. Puts the directory of the resolved npm
+ * binary first — that's where this machine's node actually lives — then the
+ * standard dirs as a fallback. A bare/relative npm path (the `resolveNpmPath`
+ * last-resort "npm"/"npm.cmd") contributes no directory, so `.` never leaks in.
+ */
+export function syncPathEnv(npmPath: string = resolveNpmPath()): string {
+  const dir = dirname(npmPath);
+  const dirs: string[] = [];
+  if (dir && dir !== "." && dir !== "/" && dir !== npmPath) dirs.push(dir);
+  for (const d of SYNC_PATH_DIRS) {
+    if (!dirs.includes(d)) dirs.push(d);
+  }
+  return dirs.join(":");
+}
+
+/**
+ * Env vars whose presence in the user's shell changes WHO the agent is, WHERE it
+ * submits, or WHAT it collects. The OS schedulers start the job with a clean
+ * environment, so if the user set any of these in their shell profile the
+ * background agent would silently diverge from the foreground command — e.g.
+ * minting a *different* anonKey under the default config dir and submitting to a
+ * separate, unclaimed dashboard while the user's real account never updates.
+ * We capture whichever are set at install/reconcile time so background ==
+ * foreground. (PATH is always set; see `syncPathEnv`.)
+ */
+const FORWARDED_ENV_VARS = [
+  "WHOBURNEDMORE_CONFIG_DIR", // identity: where the anonKey lives
+  "WHOBURNEDMORE_API", // endpoint: where submits go
+  "WHOBURNEDMORE_WEB", // dashboard URL shown to the user
+  "XDG_CONFIG_HOME", // base for the default config dir
+  "CLAUDE_CONFIG_DIR", // a primary usage-collection source
+];
+
+/**
+ * Ordered `[key, value]` environment pairs to bake into the scheduled job: PATH
+ * first (so npm's `env node` shebang resolves), then any forwarded var that is
+ * actually set. `env`/`npmPath` are injectable for tests. Deterministic for a
+ * given process env, so install-time and drift-check content always match.
+ */
+export function syncEnv(opts?: {
+  npmPath?: string;
+  env?: NodeJS.ProcessEnv;
+}): Array<[string, string]> {
+  const env = opts?.env ?? process.env;
+  const pairs: Array<[string, string]> = [["PATH", syncPathEnv(opts?.npmPath)]];
+  for (const key of FORWARDED_ENV_VARS) {
+    const value = env[key];
+    // Skip empty/unset, and skip any value with a newline: cron and systemd are
+    // line-oriented, so a `\n`/`\r` in a forwarded value would split the crontab
+    // line / `Environment=` directive and silently break the agent. These vars
+    // are paths and URLs that never legitimately contain a newline.
+    if (typeof value === "string" && value.length > 0 && !/[\r\n]/.test(value)) {
+      pairs.push([key, value]);
+    }
+  }
+  return pairs;
+}
+
+/**
  * Log inside the user's own config dir, not /tmp — a fixed /tmp path could
  * be pre-created as a symlink by another local user.
  */
@@ -60,9 +140,16 @@ export function syncLogPath(): string {
 export function buildLaunchdPlist(
   commandArgs: string[] = syncCommandArgs(),
   logPath: string = syncLogPath(),
+  envPairs: Array<[string, string]> = syncEnv({ npmPath: commandArgs[0] }),
 ): string {
   const programArguments = commandArgs
     .map((arg) => `    <string>${xmlEscape(arg)}</string>`)
+    .join("\n");
+  const envEntries = envPairs
+    .map(
+      ([k, v]) =>
+        `    <key>${xmlEscape(k)}</key>\n    <string>${xmlEscape(v)}</string>`,
+    )
     .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -74,6 +161,15 @@ export function buildLaunchdPlist(
   <array>
 ${programArguments}
   </array>
+  <!-- launchd runs jobs with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+       that excludes Homebrew. npm's shebang (and the package bin npm exec
+       spawns) is #!/usr/bin/env node, so node must be on PATH or every tick
+       dies with "env: node: No such file or directory". We also forward the
+       user's identity/endpoint/collection env so background == foreground. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+${envEntries}
+  </dict>
   <key>StartInterval</key>
   <integer>${SYNC_INTERVAL_MINUTES * 60}</integer>
   <!-- Run once right after login/reboot so a machine that was off (or asleep)
@@ -268,7 +364,18 @@ export function expectedLinuxCronLine(opts?: {
   const command = syncCommandArgs(opts?.npmPath)
     .map(shellQuote)
     .join(" ");
-  return `${cronSchedule()} ${command} >${shellQuote(opts?.logPath ?? syncLogPath())} 2>&1`;
+  // cron runs the line via /bin/sh with a bare PATH (usually /usr/bin:/bin);
+  // export node's dir (and the user's identity/endpoint env) inline so npm's
+  // `env node` shebang resolves and background submits as the same account.
+  const envPrefix = syncEnv({ npmPath: opts?.npmPath ?? resolveNpmPath() })
+    .map(([k, v]) => `${k}=${shellQuote(v)}`)
+    .join(" ");
+  const redirect = `>${shellQuote(opts?.logPath ?? syncLogPath())} 2>&1`;
+  // cron turns an unescaped `%` in the command field into a newline (the rest
+  // becomes stdin), so a path/value containing `%` would corrupt the line —
+  // escape every `%` as `\%`; cron strips the backslash and hands `%` to sh.
+  const commandField = `${envPrefix} ${command} ${redirect}`.replaceAll("%", "\\%");
+  return `${cronSchedule()} ${commandField}`;
 }
 
 // --- systemd user-timer fallback (linux) ---------------------------------
@@ -295,21 +402,36 @@ export function systemdTimerPath(): string {
 }
 
 /**
- * systemd parses ExecStart with its OWN rules (not a shell): whitespace splits
- * args, double quotes group, backslash escapes. So shell single-quoting is
- * wrong here — wrap each arg in double quotes and escape `\` and `"`.
+ * systemd parses ExecStart/Environment with its OWN rules (not a shell):
+ * whitespace splits args, double quotes group, backslash escapes — and `%` is a
+ * specifier prefix (`%h`, `%i`, …) that must be doubled to mean a literal `%`.
+ * So shell single-quoting is wrong here — wrap each value in double quotes,
+ * escape `\` and `"`, and double any `%`.
  */
 export function systemdQuote(value: string): string {
-  return `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
+  return `"${value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("%", "%%")
+    .replaceAll("\"", "\\\"")}"`;
 }
 
-export function buildSystemdService(commandArgs: string[] = syncCommandArgs()): string {
+export function buildSystemdService(
+  commandArgs: string[] = syncCommandArgs(),
+  envPairs: Array<[string, string]> = syncEnv({ npmPath: commandArgs[0] }),
+): string {
   const execStart = commandArgs.map(systemdQuote).join(" ");
+  // systemd starts the unit with its own minimal PATH; npm's `env node` shebang
+  // needs node's dir on it, and the user's identity/endpoint env must carry over
+  // so background submits as the same account — same as the launchd plist.
+  const envLines = envPairs
+    .map(([k, v]) => `Environment=${systemdQuote(`${k}=${v}`)}`)
+    .join("\n");
   return `[Unit]
 Description=whoburnedmore background token-usage sync
 
 [Service]
 Type=oneshot
+${envLines}
 ExecStart=${execStart}
 `;
 }

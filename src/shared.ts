@@ -52,6 +52,17 @@ export const DailyUsageEntry = z.object({
   origin: UsageOrigin.default("cli"),
   /** True when the numbers come from a provider's authoritative usage API. */
   verified: z.boolean().default(false),
+  /**
+   * Structural fingerprint: the number of DISTINCT provider requests
+   * (unique message-id + request-id pairs) that summed into this entry. A real
+   * heavy day is the product of thousands of distinct API requests; a hand-typed
+   * fabrication has none. The server uses this as an anti-fraud signal — a
+   * billion-token day backed by ~zero real requests is the forgery signature.
+   * Optional + back-compat: older CLIs and the ccusage fallback path (which
+   * cannot see request ids) omit it, and an omitted fingerprint is never
+   * penalized.
+   */
+  requestCount: z.number().int().nonnegative().optional(),
 });
 export type DailyUsageEntry = z.infer<typeof DailyUsageEntry>;
 
@@ -188,6 +199,64 @@ export const AnonSubmitPayload = SubmitPayload.extend({
 });
 export type AnonSubmitPayload = z.infer<typeof AnonSubmitPayload>;
 
+/**
+ * VERIFY — the per-request forensic skeleton a DELISTED user uploads via
+ * `whoburnedmore verify` to prove their usage is real. Where SubmitPayload is
+ * aggregate daily totals, this carries one record per DEDUPED provider request so
+ * the server can independently check internal consistency, physical-throughput
+ * plausibility, request-count realism and timing for a contested account. It still
+ * carries NO conversation content — only token counts, a timestamp, the model, and
+ * a HASHED provider id. Sent only on the explicit, opt-in `verify` command.
+ */
+export const VerifyRequestRecord = z.object({
+  /** Local calendar date (YYYY-MM-DD) this request is bucketed under. */
+  date: DateString,
+  /** Epoch milliseconds of the request's final (max-token) transcript line. */
+  ts: z.number().int().nonnegative(),
+  tool: z.string().min(1).max(64),
+  model: z.string().min(1).max(128),
+  inputTokens: tokenCount,
+  outputTokens: tokenCount,
+  cacheCreationTokens: tokenCount,
+  cacheReadTokens: tokenCount,
+  /** sha256(msgId|reqId), truncated — preserves uniqueness without revealing the id. */
+  reqHash: z.string().min(1).max(64),
+});
+export type VerifyRequestRecord = z.infer<typeof VerifyRequestRecord>;
+
+export const VerifyPayload = z.object({
+  cliVersion: z.string().min(1).max(32),
+  /** The per-request skeleton (bounded/sampled — see `truncated`). */
+  requests: z.array(VerifyRequestRecord).min(1).max(100000),
+  /**
+   * True when the local corpus exceeded the client upload cap and was sampled to
+   * the most recent N requests. The server treats a truncated upload conservatively
+   * (it never AUTO-passes a truncated one — it can still auto-FAIL on a physical
+   * impossibility, or route to a human).
+   */
+  truncated: z.boolean().optional(),
+});
+export type VerifyPayload = z.infer<typeof VerifyPayload>;
+
+/** One named forensic check the analyzer ran, with its result. */
+export interface VerifyCheck {
+  key: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface VerifyResponse {
+  ok: boolean;
+  /** "pass" → relisted; "fail" → stays delisted; "review" → routed to an operator. */
+  verdict: "pass" | "fail" | "review";
+  /** 0..100 forensic confidence the usage is genuine (advisory; for the operator). */
+  score: number;
+  /** True when this call cleared the account's suppression. */
+  relisted: boolean;
+  checks: VerifyCheck[];
+  message: string;
+}
+
 export function entryTotalTokens(e: DailyUsageEntry): number {
   return (
     e.inputTokens + e.outputTokens + e.cacheCreationTokens + e.cacheReadTokens
@@ -227,6 +296,13 @@ export interface LeaderboardRow {
   leaderboardSocial?: "auto" | "x" | "instagram" | "github";
   /** True once a signed-in user owns this row; false for anonymous dashboards. */
   claimed: boolean;
+  /**
+   * True when this account holds at least one PROVIDER-VERIFIED usage row — i.e.
+   * numbers pulled server-side from a provider's authoritative usage API via a
+   * connector, not self-reported by the CLI. The trust tier: a verified row is
+   * the only kind that cannot be forged. Optional (back-compat). Shown as a badge.
+   */
+  verified?: boolean;
   totalTokens: number;
   totalCostUSD: number;
   todayTokens: number;
@@ -450,6 +526,13 @@ export interface SubmitResponse {
   totalCostUSD: number;
   rank: number | null;
   profileUrl: string;
+  /**
+   * True when the account is currently delisted (suppressed) — either from a
+   * prior decision or a signal on THIS submit. Lets the CLI tell the user on a
+   * normal run that they're off the board and offer to verify, instead of the
+   * delisting being silently invisible on the surface people actually use.
+   */
+  suppressed?: boolean;
   /** Set when a `board` code was supplied and the user joined it. */
   boardCode?: string;
   /** Full URL of the friends board, e.g. https://whoburnedmore.com/boards/<code>. */

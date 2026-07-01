@@ -3,11 +3,13 @@ import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  clearAuth,
   defaultConfigDir,
   ensureAnonKey,
   loadConfig,
   recordSync,
   recordLaunchNotificationDelivered,
+  saveAuth,
   saveConfig,
 } from "../src/config.js";
 
@@ -96,15 +98,49 @@ describe("config", () => {
     });
   });
 
-  it("ignores legacy signed-in fields (no CLI login anymore)", () => {
+  it("ignores a legacy `token` field but honors the new cliToken + handle", () => {
     const dir = mkdtempSync(join(tmpdir(), "wbm-test-"));
-    // A config file left over from an old CLI that supported `login`.
+    // A config file mixing an OLD-style `token` field (the pre-rename login token)
+    // with the current `cliToken`/`handle` sign-in fields.
     writeFileSync(
       join(dir, "config.json"),
-      JSON.stringify({ token: "t0k3n", handle: "alice", anonKey: "a".repeat(64) }),
+      JSON.stringify({
+        token: "legacy-ignored",
+        cliToken: "jwt.abc.def",
+        handle: "alice",
+        anonKey: "a".repeat(64),
+      }),
     );
-    // Only the anon key survives — the device token is dropped, not honored.
-    expect(loadConfig(dir)).toEqual({ anonKey: "a".repeat(64) });
+    // The legacy `token` is dropped (we read `cliToken` now); the sign-in fields load.
+    expect(loadConfig(dir)).toEqual({
+      cliToken: "jwt.abc.def",
+      handle: "alice",
+      anonKey: "a".repeat(64),
+    });
+  });
+
+  it("saveAuth persists the CLI token + handle, preserving other fields", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wbm-test-"));
+    saveConfig(dir, { anonKey: "k".repeat(64), lastSyncAt: 99 });
+    saveAuth(dir, { cliToken: "tok-123", handle: "bob" });
+    expect(loadConfig(dir)).toEqual({
+      anonKey: "k".repeat(64),
+      lastSyncAt: 99,
+      cliToken: "tok-123",
+      handle: "bob",
+    });
+  });
+
+  it("clearAuth drops the token + handle, preserving everything else", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wbm-test-"));
+    saveConfig(dir, {
+      anonKey: "k".repeat(64),
+      cliToken: "tok-123",
+      handle: "bob",
+      lastSyncAt: 99,
+    });
+    clearAuth(dir);
+    expect(loadConfig(dir)).toEqual({ anonKey: "k".repeat(64), lastSyncAt: 99 });
   });
 });
 

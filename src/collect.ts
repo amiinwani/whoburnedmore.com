@@ -14,6 +14,12 @@ import type {
 } from "./shared.js";
 import { collectAttribution } from "./attribution.js";
 import { collectCursor } from "./cursor.js";
+import {
+  collectClaudeNative,
+  resolveClaudeConfigRoots,
+  type NativeCollectResult,
+} from "./native/claude.js";
+import { collectCodexNative } from "./native/codex.js";
 
 /** Sources ccusage can read, in the order we probe them. */
 export const SOURCES = [
@@ -111,9 +117,19 @@ export function mapCcusageDaily(
         };
       });
     } else {
+      // Sources like droid and opencode report only day-level tokens plus a
+      // `modelsUsed` list — there is no per-model breakdown to split the tokens
+      // across. When the whole day ran a single model we attribute it to that
+      // model; a mixed-model day stays "unknown" because we can't divide the
+      // day-level totals between them without fabricating a split.
+      const modelsUsed = Array.isArray(day.modelsUsed)
+        ? (day.modelsUsed as unknown[]).filter(
+            (m): m is string => typeof m === "string" && m.length > 0,
+          )
+        : [];
       candidates = [
         {
-          model: "unknown",
+          model: modelsUsed.length === 1 ? modelsUsed[0] : "unknown",
           inputTokens: norm(day.inputTokens),
           outputTokens: norm(day.outputTokens),
           cacheCreationTokens: norm(day.cacheCreationTokens),
@@ -251,6 +267,11 @@ export function dedupeDaily(entries: DailyUsageEntry[]): DailyUsageEntry[] {
     prev.cacheReadTokens += e.cacheReadTokens;
     prev.costUSD = Number((prev.costUSD + e.costUSD).toFixed(6));
     prev.verified = prev.verified && e.verified;
+    // Sum the request-id fingerprint too (only present on native-reader rows);
+    // if either side carries one, the merged row should reflect the total.
+    if (e.requestCount !== undefined || prev.requestCount !== undefined) {
+      prev.requestCount = (prev.requestCount ?? 0) + (e.requestCount ?? 0);
+    }
   }
   return [...byKey.values()];
 }
@@ -303,9 +324,42 @@ export function dedupeBlocks(blocks: BlockEntry[]): BlockEntry[] {
   return [...byStart.values()];
 }
 
+/**
+ * Choose the authoritative entries for a source: prefer our own native reader
+ * (correct dedup + the anti-fraud request-id fingerprint) for claude/codex, and
+ * fall back to the ccusage-mapped entries only when the native reader found no
+ * transcripts on disk. ccusage stays the reader for every other source.
+ */
+export function selectSourceEntries(
+  source: string,
+  ccusageEntries: DailyUsageEntry[],
+  native: { claude: NativeCollectResult; codex: NativeCollectResult },
+): DailyUsageEntry[] {
+  if (source === "claude" && native.claude.found && native.claude.entries.length > 0)
+    return native.claude.entries;
+  if (source === "codex" && native.codex.found && native.codex.entries.length > 0)
+    return native.codex.entries;
+  return ccusageEntries;
+}
+
+/**
+ * Environment for a ccusage child reading Claude logs. When the user hasn't set
+ * CLAUDE_CONFIG_DIR we set it EXPLICITLY to both known roots (~/.claude AND
+ * ~/.config/claude) so the fallback scans both even if ccusage's own default
+ * ever narrows — reading only one of the two after Claude Code's dir migration
+ * is a real ccusage miscount cause. A user-set value is respected verbatim.
+ */
+export function ccusageClaudeEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  if (env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.trim()) return env;
+  return { ...env, CLAUDE_CONFIG_DIR: resolveClaudeConfigRoots(env).join(",") };
+}
+
 async function runCcusageOnce(
   cmd: string,
   args: string[],
+  env?: NodeJS.ProcessEnv,
 ): Promise<{ json: unknown | null; transient: boolean }> {
   try {
     const { stdout } = await execFileAsync(cmd, args, {
@@ -315,6 +369,7 @@ async function runCcusageOnce(
       // for a healthy local read; a hung source gets killed and (if transient)
       // retried once below rather than stalling everything for minutes.
       timeout: 25_000,
+      ...(env ? { env } : {}),
     });
     if (!stdout) return { json: null, transient: false };
     try {
@@ -334,12 +389,16 @@ async function runCcusageOnce(
   }
 }
 
-async function runCcusage(cmd: string, args: string[]): Promise<unknown | null> {
-  const first = await runCcusageOnce(cmd, args);
+async function runCcusage(
+  cmd: string,
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<unknown | null> {
+  const first = await runCcusageOnce(cmd, args, env);
   if (first.json !== null || !first.transient) return first.json;
   // One retry on a transient failure so a flaky source stays in the report
   // run-to-run (data consistency) rather than dropping out intermittently.
-  return (await runCcusageOnce(cmd, args)).json;
+  return (await runCcusageOnce(cmd, args, env)).json;
 }
 
 /**
@@ -364,8 +423,27 @@ export async function collectAll(onProgress?: ProgressFn): Promise<CollectResult
   // one source after another. The old sequential pass walked 15 `ccusage` spawns
   // (plus session/blocks/cursor/transcripts) back-to-back and dominated the wall
   // time; in parallel the run finishes in roughly the slowest single probe.
+  // Our own correct readers for the two primary agents (Claude Code, Codex).
+  // These run alongside ccusage and WIN when they find transcripts — they fix
+  // ccusage's over/under-count and add the request-id fingerprint the server
+  // uses for anti-fraud. ccusage remains the fallback (and the only reader for
+  // every other source).
+  const nativeClaudeTask = collectClaudeNative().catch(
+    () => ({ entries: [], found: false, filesScanned: 0 }) as NativeCollectResult,
+  );
+  const nativeCodexTask = collectCodexNative().catch(
+    () => ({ entries: [], found: false, filesScanned: 0 }) as NativeCollectResult,
+  );
+
   const sourceTasks = SOURCES.map(async (source) => {
-    const json = await runCcusage(cmd, [...prefixArgs, source, "daily", "--json", "--offline"]);
+    // For Claude, force ccusage to scan both config roots (dual-dir hardening);
+    // other sources inherit the ambient environment.
+    const env = source === "claude" ? ccusageClaudeEnv() : undefined;
+    const json = await runCcusage(
+      cmd,
+      [...prefixArgs, source, "daily", "--json", "--offline"],
+      env,
+    );
     tick();
     return { source, mapped: json ? mapCcusageDaily(source, json) : [] };
   });
@@ -399,20 +477,27 @@ export async function collectAll(onProgress?: ProgressFn): Promise<CollectResult
     return a;
   });
 
-  const [sourceResults, sessions, blocks, cursor, attribution] = await Promise.all([
-    Promise.all(sourceTasks),
-    sessionTask,
-    blockTask,
-    cursorTask,
-    attributionTask,
-  ]);
+  const [sourceResults, sessions, blocks, cursor, attribution, nativeClaude, nativeCodex] =
+    await Promise.all([
+      Promise.all(sourceTasks),
+      sessionTask,
+      blockTask,
+      cursorTask,
+      attributionTask,
+      nativeClaudeTask,
+      nativeCodexTask,
+    ]);
 
+  const native = { claude: nativeClaude, codex: nativeCodex };
   const entries: DailyUsageEntry[] = [];
   const toolsFound: string[] = [];
   // Re-assemble in SOURCES order so the "from claude, codex, …" line stays stable.
+  // For claude/codex the native reader's entries win over ccusage's (see
+  // selectSourceEntries); every other source keeps ccusage's mapped entries.
   for (const { source, mapped } of sourceResults) {
-    if (mapped.length > 0) {
-      entries.push(...mapped);
+    const chosen = selectSourceEntries(source, mapped, native);
+    if (chosen.length > 0) {
+      entries.push(...chosen);
       toolsFound.push(source);
     }
   }

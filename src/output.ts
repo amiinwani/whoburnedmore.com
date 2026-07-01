@@ -54,3 +54,34 @@ export function submitNextStepLines(result: {
     "  Private until you do. Manage anytime: `npx whoburnedmore private` · `public` · `remove`.",
   ];
 }
+
+/**
+ * Post-submit "next steps" for a SIGNED-IN run. The user is already on the
+ * leaderboard (no "sign in + add X" funnel), so this just points them at the
+ * destination — org board, friends board, or their own profile. Free of usage
+ * numbers (the web reviews the burn). Pure + side-effect-free for tests.
+ */
+export function signedInNextStepLines(result: {
+  profileUrl: string;
+  boardUrl?: string | null;
+  orgBoardUrl?: string | null;
+}): string[] {
+  if (result.orgBoardUrl) {
+    return [
+      `  🏢 You're on your team board: ${sanitizeServerText(result.orgBoardUrl)}`,
+      "  → Open it to see who burned more.",
+    ];
+  }
+  if (result.boardUrl) {
+    const code = result.boardUrl.split("/").filter(Boolean).pop() ?? "";
+    return [
+      `  🤝 You're on the board: ${sanitizeServerText(result.boardUrl)}`,
+      "  → Open it to see who burned more.",
+      `  → Get a friend on it — have them run: npx whoburnedmore --board=${sanitizeServerText(code)}`,
+    ];
+  }
+  return [
+    `  Your dashboard: ${sanitizeServerText(result.profileUrl)}`,
+    "  → Open it to see your rank and share your profile.",
+  ];
+}

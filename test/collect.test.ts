@@ -1,13 +1,103 @@
 import { describe, expect, it } from "vitest";
 import {
   capByTokens,
+  ccusageClaudeEnv,
   dedupeBlocks,
   dedupeDaily,
   dedupeSessions,
   mapCcusageBlocks,
   mapCcusageDaily,
   mapCcusageSessions,
+  selectSourceEntries,
 } from "../src/collect.js";
+import type { DailyUsageEntry } from "../src/shared.js";
+import type { NativeCollectResult } from "../src/native/claude.js";
+
+const nativeEntry = (tool: string, requestCount: number): DailyUsageEntry => ({
+  date: "2026-06-10",
+  tool,
+  model: tool === "claude" ? "claude-opus-4-8" : "gpt-5-codex",
+  inputTokens: 100,
+  outputTokens: 50,
+  cacheCreationTokens: 0,
+  cacheReadTokens: 0,
+  costUSD: 0.01,
+  origin: "cli",
+  verified: false,
+  requestCount,
+});
+const ccEntry = (tool: string): DailyUsageEntry => ({
+  date: "2026-06-10",
+  tool,
+  model: "fallback-model",
+  inputTokens: 999,
+  outputTokens: 999,
+  cacheCreationTokens: 0,
+  cacheReadTokens: 0,
+  costUSD: 9.99,
+  origin: "cli",
+  verified: false,
+});
+const found = (entries: DailyUsageEntry[]): NativeCollectResult => ({
+  entries,
+  found: true,
+  filesScanned: entries.length,
+});
+const notFound: NativeCollectResult = { entries: [], found: false, filesScanned: 0 };
+
+describe("selectSourceEntries", () => {
+  it("prefers the native reader for claude/codex when it found transcripts", () => {
+    const native = { claude: found([nativeEntry("claude", 42)]), codex: found([nativeEntry("codex", 7)]) };
+    const claude = selectSourceEntries("claude", [ccEntry("claude")], native);
+    expect(claude).toHaveLength(1);
+    expect(claude[0].requestCount).toBe(42);
+    expect(claude[0].model).toBe("claude-opus-4-8"); // native, not the ccusage fallback
+    const codex = selectSourceEntries("codex", [ccEntry("codex")], native);
+    expect(codex[0].requestCount).toBe(7);
+  });
+
+  it("falls back to ccusage when the native reader found nothing on disk", () => {
+    const native = { claude: notFound, codex: notFound };
+    const claude = selectSourceEntries("claude", [ccEntry("claude")], native);
+    expect(claude[0].model).toBe("fallback-model");
+    expect(claude[0].requestCount).toBeUndefined();
+  });
+
+  it("falls back to ccusage when the native reader found files but no usage", () => {
+    const native = { claude: found([]), codex: found([]) };
+    const claude = selectSourceEntries("claude", [ccEntry("claude")], native);
+    expect(claude[0].model).toBe("fallback-model");
+  });
+
+  it("never substitutes native entries for a non-primary source", () => {
+    const native = { claude: found([nativeEntry("claude", 1)]), codex: found([nativeEntry("codex", 1)]) };
+    const gemini = selectSourceEntries("gemini", [ccEntry("gemini")], native);
+    expect(gemini[0].model).toBe("fallback-model");
+  });
+});
+
+describe("ccusageClaudeEnv (dual config-dir hardening)", () => {
+  it("forces CLAUDE_CONFIG_DIR to BOTH roots when unset", () => {
+    const out = ccusageClaudeEnv({} as NodeJS.ProcessEnv);
+    const dir = out.CLAUDE_CONFIG_DIR ?? "";
+    expect(dir).toContain(".claude");
+    expect(dir).toContain(".config");
+    expect(dir.split(",")).toHaveLength(2);
+  });
+
+  it("respects a user-set CLAUDE_CONFIG_DIR verbatim", () => {
+    const out = ccusageClaudeEnv({ CLAUDE_CONFIG_DIR: "/only/here" } as NodeJS.ProcessEnv);
+    expect(out.CLAUDE_CONFIG_DIR).toBe("/only/here");
+  });
+});
+
+describe("dedupeDaily — request fingerprint", () => {
+  it("sums requestCount when collapsing same-key rows", () => {
+    const merged = dedupeDaily([nativeEntry("claude", 3), nativeEntry("claude", 4)]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].requestCount).toBe(7);
+  });
+});
 
 describe("capByTokens", () => {
   const tok = (n: number) => ({ totalTokens: n });
@@ -233,6 +323,62 @@ describe("mapCcusageDaily", () => {
       ],
     });
     expect(entries[0].costUSD).toBe(0.25);
+  });
+
+  // Shape captured from `ccusage droid|opencode daily --json` (v20): day-level
+  // tokens + a `modelsUsed` list, no modelBreakdowns and no models map.
+  it("attributes a single-model day to its model via modelsUsed (droid/opencode)", () => {
+    const entries = mapCcusageDaily("droid", {
+      daily: [
+        {
+          date: "2026-05-02",
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 200,
+          totalCost: 1.5,
+          modelsUsed: ["claude-opus-4-7"],
+        },
+      ],
+    });
+    expect(entries).toHaveLength(1);
+    expect(entries[0].model).toBe("claude-opus-4-7");
+    expect(entries[0].inputTokens).toBe(100);
+    expect(entries[0].costUSD).toBe(1.5);
+  });
+
+  it("keeps a mixed-model day as 'unknown' (can't split day-level tokens)", () => {
+    const entries = mapCcusageDaily("opencode", {
+      daily: [
+        {
+          date: "2026-05-03",
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          totalCost: 0.25,
+          modelsUsed: ["gpt-5.2-codex", "claude-sonnet-4-6"],
+        },
+      ],
+    });
+    expect(entries).toHaveLength(1);
+    expect(entries[0].model).toBe("unknown");
+  });
+
+  it("falls back to 'unknown' when modelsUsed is absent", () => {
+    const entries = mapCcusageDaily("droid", {
+      daily: [
+        {
+          date: "2026-05-04",
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          totalCost: 0.1,
+        },
+      ],
+    });
+    expect(entries[0].model).toBe("unknown");
   });
 
   it("returns no entries for malformed output", () => {

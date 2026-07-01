@@ -20,6 +20,8 @@ import {
   resolveNpmPath,
   resolveNodePath,
   syncCommandArgs,
+  syncPathEnv,
+  syncEnv,
   shellQuote,
   systemdQuote,
   windowsCommandLine,
@@ -72,6 +74,22 @@ describe("buildLaunchdPlist", () => {
     expect(plist).toContain("<key>ProcessType</key>");
   });
 
+  it("bakes a PATH that makes `node` discoverable under launchd's stripped env", () => {
+    // launchd runs jobs with PATH=/usr/bin:/bin:/usr/sbin:/sbin — which excludes
+    // Homebrew's /opt/homebrew/bin. npm's shebang is `#!/usr/bin/env node`, so
+    // without node on PATH every tick dies with `env: node: No such file or
+    // directory` (exit 127) and the account silently stops syncing. The plist
+    // must export a PATH containing the npm/node directory.
+    const plist = buildLaunchdPlist(
+      syncCommandArgs("/opt/homebrew/bin/npm"),
+      "/home/u/.config/whoburnedmore/sync.log",
+    );
+    expect(plist).toContain("<key>EnvironmentVariables</key>");
+    expect(plist).toMatch(
+      /<key>PATH<\/key>\s*<string>[^<]*\/opt\/homebrew\/bin[^<]*<\/string>/,
+    );
+  });
+
   it("escapes launchd XML values", () => {
     const plist = buildLaunchdPlist(
       syncCommandArgs("/home/a&b/bin/npm"),
@@ -80,6 +98,87 @@ describe("buildLaunchdPlist", () => {
     expect(plist).toContain("/home/a&amp;b/bin/npm");
     expect(plist).toContain("/home/a&amp;b/.config/whoburnedmore/sync.log");
     expect(plist).not.toContain("/home/a&b/bin/npm");
+  });
+});
+
+describe("syncEnv (identity/endpoint env propagation)", () => {
+  it("always exports PATH first", () => {
+    const pairs = syncEnv({ npmPath: "/opt/homebrew/bin/npm", env: {} });
+    expect(pairs[0][0]).toBe("PATH");
+    expect(pairs[0][1].split(":")[0]).toBe("/opt/homebrew/bin");
+  });
+
+  it("forwards the user's config-dir/endpoint env so background == foreground", () => {
+    // The silent-divergence bug: a user who sets WHOBURNEDMORE_CONFIG_DIR in
+    // their shell claims dashboard X foreground, but the scheduler (clean env)
+    // mints a NEW anonKey under the default dir → submits to a separate
+    // unclaimed dashboard. The agent must carry these vars over.
+    const pairs = syncEnv({
+      npmPath: "/usr/local/bin/npm",
+      env: {
+        WHOBURNEDMORE_CONFIG_DIR: "/home/u/.wbm",
+        WHOBURNEDMORE_API: "https://api.example.com",
+        CLAUDE_CONFIG_DIR: "/home/u/.claude-alt",
+      },
+    });
+    const map = Object.fromEntries(pairs);
+    expect(map.WHOBURNEDMORE_CONFIG_DIR).toBe("/home/u/.wbm");
+    expect(map.WHOBURNEDMORE_API).toBe("https://api.example.com");
+    expect(map.CLAUDE_CONFIG_DIR).toBe("/home/u/.claude-alt");
+  });
+
+  it("omits vars that are unset or empty (no spurious keys)", () => {
+    const pairs = syncEnv({
+      npmPath: "/usr/bin/npm",
+      env: { WHOBURNEDMORE_CONFIG_DIR: "", WHOBURNEDMORE_API: undefined },
+    });
+    const keys = pairs.map(([k]) => k);
+    expect(keys).toEqual(["PATH"]);
+  });
+
+  it("drops a forwarded value containing a newline (cron/systemd are line-oriented)", () => {
+    const pairs = syncEnv({
+      npmPath: "/usr/bin/npm",
+      env: { WHOBURNEDMORE_API: "https://evil\nMALICIOUS=1", WHOBURNEDMORE_WEB: "https://ok.example" },
+    });
+    const map = Object.fromEntries(pairs);
+    expect(map.WHOBURNEDMORE_API).toBeUndefined();
+    expect(map.WHOBURNEDMORE_WEB).toBe("https://ok.example");
+  });
+
+  it("never forwards arbitrary/secret env (allowlist only)", () => {
+    const pairs = syncEnv({
+      npmPath: "/usr/bin/npm",
+      env: { AWS_SECRET_ACCESS_KEY: "shh", HOME: "/home/u" },
+    });
+    expect(pairs.map(([k]) => k)).toEqual(["PATH"]);
+  });
+
+  it("propagates forwarded vars into the launchd plist and systemd unit", () => {
+    const envPairs: Array<[string, string]> = [
+      ["PATH", "/opt/homebrew/bin:/usr/bin:/bin"],
+      ["WHOBURNEDMORE_CONFIG_DIR", "/home/u/.wbm"],
+    ];
+    const plist = buildLaunchdPlist(
+      syncCommandArgs("/opt/homebrew/bin/npm"),
+      "/home/u/.config/whoburnedmore/sync.log",
+      envPairs,
+    );
+    expect(plist).toContain("<key>WHOBURNEDMORE_CONFIG_DIR</key>");
+    expect(plist).toContain("<string>/home/u/.wbm</string>");
+    const service = buildSystemdService(syncCommandArgs("/usr/bin/npm"), envPairs);
+    expect(service).toContain('Environment="WHOBURNEDMORE_CONFIG_DIR=/home/u/.wbm"');
+  });
+
+  it("escapes cron `%` and systemd `%` specifiers in values", () => {
+    // A path/value with `%` must not become a cron newline nor a systemd specifier.
+    expect(systemdQuote("PATH=/home/od%d/bin")).toBe('"PATH=/home/od%%d/bin"');
+    const line = expectedLinuxCronLine({
+      npmPath: "/usr/bin/npm",
+      logPath: "/home/od%d/.config/whoburnedmore/sync.log",
+    });
+    expect(line).not.toMatch(/[^\\]%/); // every % is backslash-escaped for cron
+    expect(line).toContain("\\%");
   });
 });
 
@@ -96,6 +195,43 @@ describe("scheduled sync command", () => {
       "whoburnedmore",
       "sync",
     ]);
+  });
+
+  it("derives a PATH that puts the npm/node directory ahead of system dirs", () => {
+    const path = syncPathEnv("/opt/homebrew/bin/npm");
+    expect(path.split(":")[0]).toBe("/opt/homebrew/bin");
+    expect(path).toContain("/usr/bin");
+    expect(path).toContain("/bin");
+    // No duplicate entry when the npm dir is already a standard dir.
+    const dedup = syncPathEnv("/usr/bin/npm");
+    expect(dedup.split(":").filter((d) => d === "/usr/bin")).toHaveLength(1);
+  });
+
+  it("covers the real install layouts that launchd/cron strip from PATH", () => {
+    // Apple-Silicon Homebrew
+    expect(syncPathEnv("/opt/homebrew/bin/npm").split(":")[0]).toBe("/opt/homebrew/bin");
+    // Intel Homebrew / official .pkg installer (node lands in /usr/local/bin,
+    // which launchd's default PATH also excludes).
+    expect(syncPathEnv("/usr/local/bin/npm").split(":")[0]).toBe("/usr/local/bin");
+    // nvm / fnm / volta / asdf: a version-pinned dir nowhere near the standard
+    // ones — must still be prepended so `env node` resolves.
+    const nvm = syncPathEnv("/Users/me/.nvm/versions/node/v22.3.0/bin/npm");
+    expect(nvm.split(":")[0]).toBe("/Users/me/.nvm/versions/node/v22.3.0/bin");
+    expect(nvm).toContain("/usr/bin");
+  });
+
+  it("does not prepend a bare/relative npm path to PATH", () => {
+    // resolveNpmPath can fall back to a bare "npm"/"npm.cmd" with no directory;
+    // dirname("npm") === "." must never leak into PATH.
+    const path = syncPathEnv("npm");
+    expect(path.split(":")).not.toContain(".");
+    expect(path).toContain("/usr/bin");
+  });
+
+  it("includes a PATH= prefix in the cron line so node resolves under cron", () => {
+    const line = expectedLinuxCronLine({ npmPath: "/usr/local/bin/npm" });
+    expect(line).toContain("PATH=");
+    expect(line).toContain("/usr/local/bin");
   });
 
   it("quotes linux cron command and log paths without shell injection", () => {
@@ -133,6 +269,12 @@ describe("systemd user-timer fallback (linux without crontab)", () => {
     expect(service).toContain('"sync"');
     // systemd parses ExecStart itself — must NOT carry shell single-quotes.
     expect(service).not.toContain("'whoburnedmore@latest'");
+  });
+
+  it("exports a PATH so npm's `env node` shebang resolves under systemd", () => {
+    const service = buildSystemdService(syncCommandArgs("/usr/local/bin/npm"));
+    expect(service).toContain('Environment="PATH=');
+    expect(service).toContain("/usr/local/bin");
   });
 
   it("builds a timer on the 15min cadence that survives reboots", () => {
@@ -285,6 +427,20 @@ describe("plistDrift + reconcileAction (content drift reconciliation)", () => {
   it("reports ok (→ noop) when the installed agent already matches", () => {
     expect(plistDrift(expected, expected)).toBe("ok");
     expect(reconcileAction("ok")).toBe("noop");
+  });
+
+  it("reports drift for the old PATH-less plist so broken machines self-heal", () => {
+    // The exact regression (CLI 0.8.9–0.9.2): a plist that runs `npm exec` but
+    // carries no EnvironmentVariables/PATH block. Stripping that block must read
+    // as drift so the next foreground `reconcileAutoSync()` rewrites it with PATH.
+    const broken = expected.replace(
+      /  <key>EnvironmentVariables<\/key>\n  <dict>\n.*?\n  <\/dict>\n/s,
+      "",
+    );
+    expect(broken).not.toContain("EnvironmentVariables");
+    expect(broken).not.toBe(expected);
+    expect(plistDrift(broken, expected)).toBe("drift");
+    expect(reconcileAction("drift")).toBe("install");
   });
 });
 

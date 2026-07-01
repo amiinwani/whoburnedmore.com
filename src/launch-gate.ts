@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const DEFAULT_ACCESS_CODE = ""; // redacted in the public mirror — the live waitlist access code is server-side only
+export const DEFAULT_ACCESS_CODE = "n34t";
 export const LAUNCH_INVITE_COOKIE = "wbm_launch_invite";
 
 export const LaunchAccessMode = z.enum(["full", "invited", "waitlisted"]);
