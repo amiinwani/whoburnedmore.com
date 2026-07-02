@@ -297,16 +297,16 @@ async function run(flags: Flags): Promise<void> {
 
   if (cfg?.cliToken) {
     await submitSignedIn(cfg.cliToken, payload, flags, canSignIn);
-  } else if (cfg?.anonKey) {
-    await submitWithDeviceKey(cfg.anonKey, payload, flags);
   } else if (canSignIn) {
     const auth = await ensureSignedIn();
     if (!auth) return; // sign-in aborted/timed out — nothing submitted
     await submitSignedIn(auth.token, payload, flags, canSignIn);
   } else if (!flags.quiet) {
-    // Foreground but no usable terminal (CI/piped) and no stored credential — we
-    // can't run the browser sign-in here. Point the way instead of hanging or
-    // silently doing nothing; never mint an anonymous dashboard behind the user.
+    // Foreground but no usable terminal (CI/piped) and no signed-in token — we
+    // can't run the browser sign-in here. The anonymous / device-key submit path
+    // has been retired (server returns 410), so point the way instead of writing
+    // usage unauthenticated. A machine that has only a legacy device key falls
+    // here too: re-link to get an authenticated token.
     console.log(pc.yellow("  Sign in to put your usage on the leaderboard."));
     console.log(
       pc.dim(
@@ -314,7 +314,8 @@ async function run(flags: Flags): Promise<void> {
       ),
     );
   } else {
-    // Background with no credential: stay completely silent — never prompt.
+    // Background with no signed-in token: stay completely silent — never prompt,
+    // never submit unauthenticated.
     return;
   }
 }
@@ -459,58 +460,6 @@ async function submitSignedIn(
 }
 
 /**
- * Legacy / headless path: submit with a device key already bound to an account
- * server-side (a `link`-ed server, or an install from before sign-in existed).
- * Mirrors the previous anonymous flow, including the claim handoff in the opened
- * URL so a not-yet-claimed device key can still be claimed on the web.
- */
-async function submitWithDeviceKey(
-  anonKey: string,
-  payload: SubmitPayload,
-  flags: Flags,
-): Promise<void> {
-  const result = await anonSubmit(anonKey, payload);
-  try {
-    recordSync();
-  } catch {
-    /* best-effort — never fail a submit over a freshness stamp */
-  }
-  try {
-    const config = loadConfig();
-    if (result.launch?.live && !config?.launchNotificationDeliveredAt) {
-      if (notifyLaunchLive()) {
-        recordLaunchNotificationDelivered();
-      }
-    }
-  } catch {
-    /* best-effort — never fail a submit over a launch notification */
-  }
-  const { baseUrl, target } = resolveOpenTarget(result, anonKey);
-  const trusted = isTrustedWebUrl(baseUrl);
-  if (!flags.quiet) {
-    console.log(
-      pc.green("  ✓ Synced securely.") +
-        pc.dim(" Only your daily totals left this machine — never your prompts, code, or file names."),
-    );
-    if (trusted) {
-      console.log(pc.dim("  Opening your dashboard in your browser…"));
-      openBrowser(target);
-    } else {
-      console.log(
-        pc.dim("  The server returned an unexpected dashboard address, so it was NOT auto-opened. Open it yourself only if you trust it:"),
-      );
-      console.log(`  ${sanitizeServerText(baseUrl)}`);
-    }
-    for (const line of submitNextStepLines(result)) {
-      if (line.includes("→")) console.log(pc.bold(line));
-      else if (line.startsWith("  Private until you do")) console.log(pc.dim(line));
-      else console.log(line);
-    }
-  }
-  afterSubmitChores(flags);
-}
-
-/**
  * Post-submit housekeeping shared by both submit paths: heal-on-run reconcile of
  * the background sync (install if absent, repair if drifted) and the one-line
  * background-sync status footer. Best-effort — never fails an already-good submit.
@@ -536,6 +485,11 @@ async function linkServerInstall(token: string | undefined): Promise<void> {
   }
   const anonKey = ensureAnonKey();
   const linked = await redeemServerInstall(token, anonKey);
+  // Store the authenticated CLI token the server issues so subsequent runs submit
+  // via /v1/submit (the anon device-key submit path has been retired).
+  if (linked.cliToken) {
+    saveAuth(undefined, { cliToken: linked.cliToken, handle: linked.handle });
+  }
   const handle = sanitizeServerText(linked.handle);
   console.log(
     linked.alreadyLinked

@@ -14,6 +14,8 @@ export interface ServerInstallRedeemResponse {
   profileUrl: string;
   mergedDays: number;
   alreadyLinked: boolean;
+  /** Authenticated CLI token so a headless install submits via /v1/submit. */
+  cliToken?: string;
 }
 
 export function apiBase(): string {
@@ -133,7 +135,15 @@ export async function verifyUsage(
   return body as VerifyResponse;
 }
 
-/** Submit anonymously: no sign-in, the key owns a public, shareable dashboard. */
+/**
+ * Surfaced when the server has retired an anonymous endpoint (410). Anonymous
+ * submission/management no longer exists; the user must sign in (or `link` a
+ * server) to submit or manage usage.
+ */
+export const ANON_RETIRED_MESSAGE =
+  "Anonymous mode has been retired. Run `npx whoburnedmore` and sign in, or `npx whoburnedmore link --token=…` for a server/CI, to put your usage on the leaderboard.";
+
+/** Submit anonymously: RETIRED server-side (410). Kept for --local publish + tests. */
 export async function anonSubmit(
   anonKey: string,
   payload: SubmitPayload,
@@ -141,6 +151,7 @@ export async function anonSubmit(
   const { status, body } = await post<
     AnonSubmitResponse | { error: string; details?: string[] }
   >("/v1/anon/submit", { ...payload, anonKey });
+  if (status === 410) throw new Error(ANON_RETIRED_MESSAGE);
   if (status !== 200) {
     const err = body as { error: string; details?: string[] };
     const details = err.details?.length ? `\n  - ${err.details.join("\n  - ")}` : "";
@@ -271,6 +282,7 @@ export async function anonVisibility(
     "/v1/anon/visibility",
     { anonKey, listed },
   );
+  if (status === 410) throw new Error(ANON_RETIRED_MESSAGE);
   if (status !== 200) {
     throw new Error(body.error ?? `failed (HTTP ${status})`);
   }
@@ -284,6 +296,7 @@ export async function anonRemove(anonKey: string): Promise<void> {
     body: JSON.stringify({ anonKey }),
     signal: AbortSignal.timeout(30_000),
   });
+  if (res.status === 410) throw new Error(ANON_RETIRED_MESSAGE);
   if (res.status !== 200) {
     const b = (await res.json().catch(() => ({}))) as { error?: string };
     throw new Error(b.error ?? `failed (HTTP ${res.status})`);
