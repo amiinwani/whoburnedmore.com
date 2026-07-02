@@ -20,6 +20,7 @@ import {
   type NativeCollectResult,
 } from "./native/claude.js";
 import { collectCodexNative } from "./native/codex.js";
+import { loadLivePricing } from "./pricing-live.js";
 
 /** Sources ccusage can read, in the order we probe them. */
 export const SOURCES = [
@@ -413,6 +414,11 @@ export const COLLECT_STAGES = SOURCES.length + 4;
 
 /** Run ccusage for every known source, add Cursor, and merge the results. */
 export async function collectAll(onProgress?: ProgressFn): Promise<CollectResult> {
+  // Freshen the pricing table BEFORE any reader prices an entry (24h disk
+  // cache, ~5s network cap on a cold day, silent fallback to the baked
+  // snapshot). This is what keeps costUSD current on already-installed CLIs.
+  await loadLivePricing().catch(() => {});
+
   const { cmd, prefixArgs } = resolveCcusageBin();
   let done = 0;
   // Each task bumps the bar as it finishes. Because everything runs at once,

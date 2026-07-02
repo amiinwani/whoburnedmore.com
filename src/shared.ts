@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { LaunchStatusResponse } from "./launch-gate.js";
 import { RESERVED_SUBDOMAINS } from "./tenant.js";
 export * from "./launch-gate.js";
+export * from "./pricing.js";
 
 /** Calendar date in YYYY-MM-DD (UTC). */
 export const DateString = z
