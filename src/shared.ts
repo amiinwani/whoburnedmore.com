@@ -646,6 +646,53 @@ export const RESERVED_SLUGS = new Set<string>([
   "sitemap",
 ]);
 
+/**
+ * Word-boundary matched abuse/slur tokens disallowed in org slugs and names.
+ * Matched on a normalized copy (lowercased, leetspeak folded, non-letters
+ * stripped, split on non-alphanumerics) so "f4ggot" is caught while innocent
+ * substrings are NOT — a match requires the token to stand as a whole normalized
+ * run (so "Scunthorpe" / "assassin" pass). Intentionally small: blocks the
+ * obvious cases, not an exhaustive filter.
+ */
+const ORG_TEXT_BLOCKLIST = new Set<string>([
+  "nigger",
+  "nigga",
+  "faggot",
+  "retard",
+  "rape",
+  "rapist",
+  "kike",
+  "spic",
+  "chink",
+  "cunt",
+]);
+const ORG_TEXT_LEET: Record<string, string> = {
+  "0": "o",
+  "1": "i",
+  "3": "e",
+  "4": "a",
+  "5": "s",
+  "7": "t",
+  "8": "b",
+  "@": "a",
+  "$": "s",
+};
+
+/** True when `input` contains no blocklisted slur/abuse token (see ORG_TEXT_BLOCKLIST). */
+export function isCleanOrgText(input: string): boolean {
+  const runs = String(input)
+    .toLowerCase()
+    .split(/[^a-z0-9@$]+/)
+    .map((run) =>
+      run.replace(/[0-9@$]/g, (c) => ORG_TEXT_LEET[c] ?? c).replace(/[^a-z]/g, ""),
+    );
+  return !runs.some((run) => run.length > 0 && ORG_TEXT_BLOCKLIST.has(run));
+}
+
+/** All org lifecycle states. `suspended` = admin-hidden but retained (reversible);
+ *  `archived` = soft-deleted. */
+export type OrgStatus = "active" | "suspended" | "archived";
+
 /** Org slug rules: 2–32 chars, lowercase alphanumeric + single internal hyphens. */
 export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 
@@ -666,7 +713,8 @@ export const OrgSlug = z
   .string()
   .min(2)
   .max(32)
-  .refine(isValidSlug, "invalid or reserved slug");
+  .refine(isValidSlug, "invalid or reserved slug")
+  .refine(isCleanOrgText, "invalid or reserved slug");
 
 /** Optional event window (inclusive YYYY-MM-DD). Used to time-box a hackathon. */
 export const OrgWindow = z
@@ -729,6 +777,24 @@ export const OrgProvisionInput = z.object({
   issueClaimLink: z.boolean().optional(),
 });
 export type OrgProvisionInput = z.infer<typeof OrgProvisionInput>;
+
+/**
+ * Signed-in self-service org creation: the authenticated caller becomes the
+ * owner immediately (no approval, no claim link). Slug + name are run through the
+ * reserved/abuse filters via OrgSlug and isCleanOrgText.
+ */
+export const OrgSelfServeInput = z.object({
+  slug: OrgSlug,
+  name: z.string().min(1).max(120).refine(isCleanOrgText, "name not allowed"),
+  type: OrgType,
+  description: z.string().max(2000).optional(),
+  accentColor: HexColor.optional(),
+  /** Who can view the board — defaults to the type's default when omitted. */
+  boardVisibility: OrgBoardVisibility.optional(),
+  /** Optional event window (mainly for hackathons). */
+  window: OrgWindow.optional(),
+});
+export type OrgSelfServeInput = z.infer<typeof OrgSelfServeInput>;
 
 /** Org admin settings update (PATCH). All fields optional. */
 export const OrgSettingsInput = z.object({
@@ -889,6 +955,14 @@ export interface OrgAdminSummary {
   /** Live one-time owner-claim token, or null when no claim link is active.
    *  The dashboard builds `/o/<slug>/claim?t=<token>` from it. Optional (back-compat). */
   claimToken?: string | null;
+  /** Org lifecycle status. Optional (back-compat; legacy rows are active). */
+  status?: OrgStatus;
+  /** How the org was created — surfaces self-serve vs operator provisioning. Optional. */
+  createdVia?: "self-serve" | "admin" | "seed" | null;
+  /** Owner's handle, echoed for abuse tracing next to createdVia. Optional. */
+  createdByHandle?: string | null;
+  /** How many non-archived orgs this owner owns — flags cap abuse. Optional. */
+  ownerOrgCount?: number;
 }
 
 export { ROOT_DOMAIN, normalizeHost, resolveTenant } from "./tenant.js";
